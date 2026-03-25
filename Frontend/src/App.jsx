@@ -28,7 +28,8 @@ import {
 
 const DOCUMENTS_KEY = 'findx-documents'
 const CHAT_STORE_KEY = 'findx-chat-store'
-const SIDEBAR_COLLAPSED_KEY = 'findx-sidebar-collapsed'
+const LEFT_SIDEBAR_OPEN_KEY = 'findx-left-sidebar-open'
+const RIGHT_SIDEBAR_OPEN_KEY = 'findx-right-sidebar-open'
 
 const defaultLoginForm = {
   email: '',
@@ -42,6 +43,14 @@ function readStorage(key, fallback) {
   } catch {
     return fallback
   }
+}
+
+function getDefaultSidebarOpen() {
+  if (typeof window === 'undefined') {
+    return true
+  }
+
+  return window.innerWidth >= 1280
 }
 
 function sortConversations(conversations) {
@@ -61,8 +70,10 @@ function normalizeDocuments(documents) {
 
     if (Array.isArray(document.visibleTo)) {
       const hasHr = document.visibleTo.includes('hr-user')
-      const hasEmployee = document.visibleTo.includes('employee-user')
-      const visibilityScope = hasHr && hasEmployee ? 'both' : hasHr ? 'hr' : hasEmployee ? 'employee' : 'private'
+      const hasDeveloper =
+        document.visibleTo.includes('developer-user') ||
+        document.visibleTo.includes('employee-user')
+      const visibilityScope = hasHr && hasDeveloper ? 'both' : hasHr ? 'hr' : hasDeveloper ? 'developer' : 'private'
       const { visibleTo, ...rest } = document
 
       return {
@@ -87,8 +98,40 @@ function formatChatHistory(messages) {
     }))
 }
 
+function normalizeSource(source, index) {
+  return {
+    id: source?.id ?? `source-${index}`,
+    doc:
+      source?.doc ??
+      source?.document ??
+      source?.doc_uuid ??
+      'Retrieved document',
+    docUuid: source?.doc_uuid ?? null,
+    page: source?.page ?? null,
+    confidence: source?.confidence ?? 'Source-backed',
+    text: source?.text ?? source?.snippet ?? '',
+    mode: 'retrieval',
+  }
+}
+
 function getBackendSessionId(user) {
   return user?.id ?? ''
+}
+
+function getWorkspaceLayoutClass(isLeftSidebarOpen, isRightSidebarOpen) {
+  if (isLeftSidebarOpen && isRightSidebarOpen) {
+    return 'xl:grid-cols-[280px_minmax(0,1fr)_320px]'
+  }
+
+  if (isLeftSidebarOpen) {
+    return 'xl:grid-cols-[280px_minmax(0,1fr)]'
+  }
+
+  if (isRightSidebarOpen) {
+    return 'xl:grid-cols-[minmax(0,1fr)_320px]'
+  }
+
+  return 'xl:grid-cols-[minmax(0,1fr)]'
 }
 
 function App() {
@@ -109,22 +152,25 @@ function App() {
   const [uploadError, setUploadError] = useState('')
   const [uploadVisibilityScope, setUploadVisibilityScope] = useState('private')
   const [isUploading, setIsUploading] = useState(false)
-  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() =>
-    readStorage(SIDEBAR_COLLAPSED_KEY, false),
+  const [isLeftSidebarOpen, setIsLeftSidebarOpen] = useState(() =>
+    readStorage(LEFT_SIDEBAR_OPEN_KEY, getDefaultSidebarOpen()),
+  )
+  const [isRightSidebarOpen, setIsRightSidebarOpen] = useState(() =>
+    readStorage(RIGHT_SIDEBAR_OPEN_KEY, getDefaultSidebarOpen()),
   )
   const chatViewportRef = useRef(null)
 
   const userKey = currentUser?.email.toLowerCase() ?? null
   const conversations = userKey ? chatStore[userKey] ?? [] : []
-  const accessibleDocuments = currentUser
-    ? getAccessibleDocuments(documents, currentUser)
-    : []
+  const accessibleDocuments = currentUser ? getAccessibleDocuments(documents, currentUser) : []
   const activeConversation =
     currentUser && currentUser.role !== 'Admin'
       ? conversations.find((conversation) => conversation.id === activeConversationId) ??
         conversations[0] ??
         null
       : null
+  const suggestedQueries = currentUser ? SUGGESTED_QUERIES[currentUser.role] ?? [] : []
+
   useEffect(() => {
     window.localStorage.setItem(DOCUMENTS_KEY, JSON.stringify(documents))
   }, [documents])
@@ -135,10 +181,17 @@ function App() {
 
   useEffect(() => {
     window.localStorage.setItem(
-      SIDEBAR_COLLAPSED_KEY,
-      JSON.stringify(isSidebarCollapsed),
+      LEFT_SIDEBAR_OPEN_KEY,
+      JSON.stringify(isLeftSidebarOpen),
     )
-  }, [isSidebarCollapsed])
+  }, [isLeftSidebarOpen])
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      RIGHT_SIDEBAR_OPEN_KEY,
+      JSON.stringify(isRightSidebarOpen),
+    )
+  }, [isRightSidebarOpen])
 
   useEffect(() => {
     setUploadVisibilityScope(currentUser ? getDefaultUploadVisibility(currentUser) : 'private')
@@ -358,14 +411,19 @@ function App() {
         chatId: getBackendSessionId(currentUser),
         chatHistory: formatChatHistory(existingConversation?.messages ?? []),
       })
+      const sources = Array.isArray(response.sources)
+        ? response.sources.map((source, index) => normalizeSource(source, index))
+        : []
 
       const assistantMessage = {
         id: crypto.randomUUID(),
         type: 'assistant',
         kind: 'response',
         text: response.answer,
-        explanation: 'This answer was returned by the live backend search service.',
-        sources: [],
+        explanation:
+          response.explanation ||
+          'This answer is grounded in the highest-ranked document passages returned by the backend.',
+        sources,
         createdAt: new Date().toISOString(),
       }
 
@@ -380,14 +438,19 @@ function App() {
             : conversation,
         ),
       )
-      setSelectedSource(null)
+
+      if (sources.length) {
+        setSelectedSource(sources[0])
+        setIsRightSidebarOpen(true)
+      }
     } catch (error) {
       const errorMessage = {
         id: crypto.randomUUID(),
         type: 'assistant',
         kind: 'response',
         text: error.message || 'The backend could not answer this query.',
-        explanation: 'The request reached the server but did not complete successfully.',
+        explanation:
+          'The request reached the server, but retrieval or grounded generation failed before a complete answer was returned.',
         sources: [],
         createdAt: new Date().toISOString(),
       }
@@ -487,28 +550,11 @@ function App() {
     }
   }
 
-  const handleOpenDocument = (document) => {
-    setSelectedSource({
-      id: `open-${document.id}`,
-      doc: document.name,
-      page: null,
-      confidence: null,
-      text: '',
-      mode: 'document',
-      summary: document.summary,
-      ownerName: document.ownerName,
-    })
-  }
-
-  const handleToggleSidebar = () => {
-    setIsSidebarCollapsed((current) => !current)
-  }
-
   if (isAuthLoading) {
     return (
-      <div className="min-h-screen bg-slate-950 text-slate-100">
-        <div className="flex min-h-screen items-center justify-center px-4 text-sm text-slate-400">
-          Restoring your FindX session...
+      <div className="min-h-screen bg-[#212121] text-white">
+        <div className="flex min-h-screen items-center justify-center px-4 text-sm text-zinc-400">
+          Restoring your session...
         </div>
       </div>
     )
@@ -516,7 +562,7 @@ function App() {
 
   if (!currentUser) {
     return (
-      <div className="min-h-screen bg-slate-950 text-slate-100">
+      <div className="min-h-screen bg-[#212121] text-white">
         <LoginPage
           form={loginForm}
           onChange={handleLoginChange}
@@ -529,14 +575,8 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 xl:h-[100dvh] xl:overflow-hidden">
-      <div className="pointer-events-none fixed inset-0 overflow-hidden">
-        <div className="absolute inset-x-0 top-0 h-72 bg-[radial-gradient(circle_at_top,_rgba(59,130,246,0.25),_transparent_58%)]" />
-        <div className="absolute right-[-10%] top-1/4 h-80 w-80 rounded-full bg-cyan-400/10 blur-3xl" />
-        <div className="absolute left-[-10%] bottom-0 h-80 w-80 rounded-full bg-indigo-500/10 blur-3xl" />
-      </div>
-
-      <div className="relative mx-auto flex min-h-screen max-w-[1600px] flex-col px-4 py-4 sm:px-6 lg:px-8 xl:h-[100dvh] xl:min-h-0">
+    <div className="min-h-screen bg-[#212121] text-white xl:h-screen xl:overflow-hidden">
+      <div className="mx-auto flex min-h-screen max-w-[1600px] flex-col px-4 py-4 sm:px-6 lg:px-8 xl:h-screen xl:min-h-0">
         <Navbar
           currentUser={currentUser}
           onLogout={handleLogout}
@@ -544,14 +584,14 @@ function App() {
         />
 
         {uploadError ? (
-          <div className="mt-4 rounded-2xl border border-rose-400/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
+          <div className="mt-4 rounded-2xl border border-red-400/20 bg-red-500/10 px-4 py-3 text-sm text-red-100">
             {uploadError}
           </div>
         ) : null}
 
         {isUploading ? (
-          <div className="mt-4 rounded-2xl border border-blue-400/20 bg-blue-500/10 px-4 py-3 text-sm text-blue-100">
-            Uploading and indexing PDF/PPT files...
+          <div className="mt-4 rounded-2xl border border-white/10 bg-[#171717] px-4 py-3 text-sm text-zinc-300">
+            Uploading and indexing files...
           </div>
         ) : null}
 
@@ -567,74 +607,61 @@ function App() {
           />
         ) : (
           <main
-            className={`mt-4 grid flex-1 gap-4 xl:min-h-0 xl:overflow-hidden xl:transition-all xl:duration-300 ${
-              isSidebarCollapsed
-                ? 'xl:grid-cols-[40px_minmax(0,1fr)_minmax(300px,360px)] 2xl:grid-cols-[40px_minmax(0,1fr)_minmax(340px,420px)]'
-                : 'xl:grid-cols-[minmax(280px,320px)_minmax(0,1fr)_minmax(300px,360px)] 2xl:grid-cols-[minmax(300px,360px)_minmax(0,1fr)_minmax(340px,420px)]'
-            }`}
+            className={`mt-4 grid flex-1 gap-4 xl:min-h-0 xl:overflow-hidden ${getWorkspaceLayoutClass(
+              isLeftSidebarOpen,
+              isRightSidebarOpen,
+            )}`}
           >
-            <div className="relative min-h-[78vh] xl:min-h-0">
-              <button
-                type="button"
-                onClick={handleToggleSidebar}
-                className={`hidden xl:flex absolute top-1/2 z-20 h-14 w-8 items-center justify-center rounded-full border border-white/10 bg-slate-900/90 text-sm font-semibold text-slate-200 shadow-lg shadow-slate-950/40 transition hover:bg-slate-800 ${
-                  isSidebarCollapsed
-                    ? 'left-1/2 -translate-x-1/2 -translate-y-1/2'
-                    : 'right-[-16px] -translate-y-1/2'
-                }`}
-                aria-label={isSidebarCollapsed ? 'Show tools sidebar' : 'Hide tools sidebar'}
-                title={isSidebarCollapsed ? 'Show tools sidebar' : 'Hide tools sidebar'}
-              >
-                {isSidebarCollapsed ? '>' : '<'}
-              </button>
+            {isLeftSidebarOpen ? (
+              <AccessSidebar
+                currentUser={currentUser}
+                documents={accessibleDocuments}
+                conversations={conversations}
+                activeConversationId={activeConversation?.id}
+                onConversationSelect={setActiveConversationId}
+                onNewChat={handleNewChat}
+                uploadVisibilityScope={uploadVisibilityScope}
+                onUploadVisibilityChange={handleUploadVisibilityChange}
+                onFileUpload={handleFileUpload}
+                onToggle={() => setIsLeftSidebarOpen(false)}
+              />
+            ) : null}
 
-              <div
-                className={`h-full transition-all duration-300 ease-out ${
-                  isSidebarCollapsed
-                    ? 'xl:pointer-events-none xl:absolute xl:inset-y-0 xl:left-0 xl:w-[320px] xl:-translate-x-[calc(100%+0.75rem)] xl:opacity-0'
-                    : 'xl:h-full xl:translate-x-0 xl:opacity-100'
-                }`}
-              >
-                <AccessSidebar
-                  currentUser={currentUser}
-                  documents={accessibleDocuments}
-                  conversations={conversations}
-                  activeConversationId={activeConversation?.id}
-                  onConversationSelect={setActiveConversationId}
-                  onNewChat={handleNewChat}
-                  uploadVisibilityScope={uploadVisibilityScope}
-                  onUploadVisibilityChange={handleUploadVisibilityChange}
-                  onFileUpload={handleFileUpload}
-                  onOpenDocument={handleOpenDocument}
-                />
-              </div>
-            </div>
+            <section className="flex min-h-[72vh] flex-col rounded-3xl border border-white/10 bg-[#171717] xl:min-h-0 xl:overflow-hidden">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-4 py-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsLeftSidebarOpen((current) => !current)}
+                    className="rounded-full border border-white/10 bg-[#212121] px-3 py-2 text-xs text-zinc-300 transition hover:bg-[#2a2a2a]"
+                  >
+                    {isLeftSidebarOpen ? 'Hide history' : 'Show history'}
+                  </button>
 
-            <section className="flex min-h-[78vh] flex-col overflow-hidden rounded-[28px] border border-white/10 bg-white/[0.08] shadow-2xl shadow-slate-950/40 backdrop-blur-xl xl:h-full xl:min-h-0">
-              <div className="border-b border-white/10 px-5 py-4">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.28em] text-slate-400">
-                      FindX chat
-                    </p>
-                    <h1 className="mt-1 text-2xl font-semibold tracking-tight text-white">
-                      Search only across files visible to your account
-                    </h1>
-                  </div>
-                  <div className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-2 text-sm text-slate-300">
-                    {accessibleDocuments.length} accessible files
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsRightSidebarOpen((current) => !current)}
+                    className="rounded-full border border-white/10 bg-[#212121] px-3 py-2 text-xs text-zinc-300 transition hover:bg-[#2a2a2a]"
+                  >
+                    {isRightSidebarOpen ? 'Hide evidence' : 'Show evidence'}
+                  </button>
                 </div>
+
+                <p className="text-sm text-zinc-400">
+                  {activeConversation?.title ?? 'New chat'}
+                </p>
               </div>
 
               <ChatWindow
                 messages={activeConversation?.messages ?? []}
                 isTyping={isTyping}
-                role={currentUser.role}
-                onSourceSelect={setSelectedSource}
+                onSourceSelect={(source) => {
+                  setSelectedSource(source)
+                  setIsRightSidebarOpen(true)
+                }}
                 onSuggestedQuery={handleSubmit}
                 selectedSource={selectedSource}
-                suggestedQueries={SUGGESTED_QUERIES[currentUser.role]}
+                suggestedQueries={suggestedQueries}
                 chatViewportRef={chatViewportRef}
               />
 
@@ -646,11 +673,12 @@ function App() {
               />
             </section>
 
-            <SourceViewer
-              selectedSource={selectedSource}
-              role={currentUser.role}
-              documents={accessibleDocuments}
-            />
+            {isRightSidebarOpen ? (
+              <SourceViewer
+                selectedSource={selectedSource}
+                onToggle={() => setIsRightSidebarOpen(false)}
+              />
+            ) : null}
           </main>
         )}
       </div>

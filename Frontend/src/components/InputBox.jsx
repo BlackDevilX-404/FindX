@@ -1,5 +1,13 @@
 import { useEffect, useEffectEvent, useRef, useState } from 'react'
 
+function MicIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="h-5 w-5 fill-current">
+      <path d="M12 15a3 3 0 0 0 3-3V7a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm5-3a1 1 0 1 1 2 0 7 7 0 0 1-6 6.93V21h3a1 1 0 1 1 0 2H8a1 1 0 1 1 0-2h3v-2.07A7 7 0 0 1 5 12a1 1 0 1 1 2 0 5 5 0 1 0 10 0Z" />
+    </svg>
+  )
+}
+
 function InputBox({ input, onInputChange, onSubmit, isTyping }) {
   const recognitionRef = useRef(null)
   const [isMicSupported, setIsMicSupported] = useState(false)
@@ -88,19 +96,18 @@ function InputBox({ input, onInputChange, onSubmit, isTyping }) {
 
   return (
     <div className="border-t border-white/10 px-4 py-4">
-      <div className="rounded-[26px] border border-white/10 bg-slate-950/60 p-3 shadow-inner shadow-slate-950/30">
+      <div className="mx-auto flex max-w-3xl flex-col gap-2 rounded-[28px] border border-white/10 bg-[#2a2a2a] p-3">
         <div className="flex items-end gap-3">
           <button
             type="button"
             onClick={handleMicClick}
             disabled={isTyping}
-            className={`hidden h-11 w-11 shrink-0 items-center justify-center rounded-2xl border text-sm transition sm:inline-flex ${
+            className={`hidden h-11 w-11 shrink-0 items-center justify-center rounded-full border text-zinc-200 transition sm:inline-flex ${
               isListening
-                ? 'border-blue-300/40 bg-blue-500/15 text-blue-100'
-                : 'border-white/10 bg-white/5 text-slate-300 hover:bg-white/10'
+                ? 'border-white/20 bg-[#3a3a3a]'
+                : 'border-white/10 bg-[#212121] hover:bg-[#303030]'
             } disabled:cursor-not-allowed disabled:opacity-50`}
             aria-label={isListening ? 'Stop voice input' : 'Start voice input'}
-            aria-pressed={isListening}
             title={
               isMicSupported
                 ? isListening
@@ -109,39 +116,29 @@ function InputBox({ input, onInputChange, onSubmit, isTyping }) {
                 : 'Voice input is not supported in this browser'
             }
           >
-            {isListening ? 'Rec' : 'Mic'}
+            <MicIcon />
           </button>
 
-          <div className="flex-1">
-            <textarea
-              value={input}
-              onChange={(event) => onInputChange(event.target.value)}
-              onKeyDown={handleKeyDown}
-              rows={1}
-              placeholder="Ask about HR policy, compliance, leave, onboarding, or company knowledge..."
-              className="max-h-36 min-h-[44px] w-full resize-none bg-transparent px-2 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500"
-            />
-
-            <div className="mt-1 px-2 text-[11px] text-slate-500">
-              {micError
-                ? micError
-                : isListening
-                  ? 'Listening... speak now.'
-                  : isMicSupported
-                    ? 'Click Mic to dictate.'
-                    : 'Voice input is available only in supported browsers.'}
-            </div>
-          </div>
+          <textarea
+            value={input}
+            onChange={(event) => onInputChange(event.target.value)}
+            onKeyDown={handleKeyDown}
+            rows={1}
+            placeholder="Message FindX"
+            className="max-h-40 min-h-[44px] flex-1 resize-none bg-transparent px-1 py-2 text-sm text-white outline-none placeholder:text-zinc-500"
+          />
 
           <button
             type="button"
             onClick={() => onSubmit(input)}
             disabled={isTyping || !input.trim()}
-            className="inline-flex h-11 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-r from-blue-500 to-indigo-500 px-4 text-sm font-medium text-white shadow-lg shadow-blue-950/30 transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-50"
+            className="inline-flex h-11 shrink-0 items-center justify-center rounded-full bg-white px-4 text-sm font-medium text-black transition hover:bg-zinc-200 disabled:cursor-not-allowed disabled:bg-zinc-600"
           >
             Send
           </button>
         </div>
+
+        {micError ? <p className="px-1 text-xs text-red-300">{micError}</p> : null}
       </div>
     </div>
   )

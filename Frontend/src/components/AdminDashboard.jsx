@@ -11,45 +11,42 @@ function AdminDashboard({
   onDeleteDocument,
 }) {
   return (
-    <main className="mt-4 grid flex-1 gap-4 xl:min-h-0 xl:grid-cols-[minmax(0,1.15fr)_minmax(300px,0.85fr)] xl:overflow-hidden">
-      <section className="rounded-[28px] border border-white/10 bg-white/[0.07] p-5 shadow-2xl shadow-slate-950/40 backdrop-blur-xl xl:flex xl:min-h-0 xl:flex-col">
-        <div className="border-b border-white/10 pb-5">
-          <p className="text-xs uppercase tracking-[0.28em] text-slate-400">Admin console</p>
-          <h1 className="mt-2 text-2xl font-semibold text-white">Manage uploads and visibility</h1>
-          <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-400">
-            Admin can upload files, change visibility at any time, and delete any document.
+    <main className="mt-4 grid flex-1 gap-4 xl:min-h-0 xl:grid-cols-[minmax(0,1fr)_320px] xl:overflow-hidden">
+      <section className="flex flex-col rounded-3xl border border-white/10 bg-[#171717] p-4 xl:min-h-0">
+        <div className="border-b border-white/10 pb-4">
+          <h1 className="text-xl font-medium text-white">Documents</h1>
+          <p className="mt-2 text-sm text-zinc-400">
+            Manage uploaded files and their visibility.
           </p>
         </div>
 
-        <div className="mt-5 space-y-4 xl:min-h-0 xl:flex-1 xl:overflow-y-auto xl:pr-1">
+        <div className="mt-4 min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
           {documents.map((document) => (
             <div
               key={document.id}
-              className="rounded-[24px] border border-white/10 bg-slate-950/50 p-4"
+              className="rounded-2xl border border-white/10 bg-[#212121] p-4"
             >
               <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <p className="text-base font-semibold text-white">{document.name}</p>
-                    <span className="rounded-full bg-white/[0.06] px-2 py-1 text-[11px] text-slate-300">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="truncate text-sm font-medium text-white">{document.name}</p>
+                    <span className="rounded-full border border-white/10 bg-[#171717] px-2 py-1 text-[11px] text-zinc-400">
                       {document.type}
                     </span>
                   </div>
-                  <p className="mt-2 text-sm text-slate-400">{document.summary}</p>
+                  <p className="mt-2 text-sm text-zinc-400">{document.summary}</p>
+                  <p className="mt-2 text-xs text-zinc-500">
+                    Owner: {document.ownerName} | Uploaded: {document.uploadedAt}
+                  </p>
                 </div>
-                <div className="flex items-start gap-2">
-                  <div className="text-right text-xs text-slate-400">
-                    <p>Owner: {document.ownerName}</p>
-                    <p className="mt-1">Uploaded: {document.uploadedAt}</p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => onDeleteDocument(document.id)}
-                    className="rounded-full border border-rose-400/20 bg-rose-500/10 px-3 py-1.5 text-xs text-rose-100 transition hover:bg-rose-500/20"
-                  >
-                    Delete
-                  </button>
-                </div>
+
+                <button
+                  type="button"
+                  onClick={() => onDeleteDocument(document.id)}
+                  className="rounded-full border border-red-400/20 bg-red-500/10 px-3 py-1.5 text-xs text-red-100 transition hover:bg-red-500/20"
+                >
+                  Delete
+                </button>
               </div>
 
               <div className="mt-4">
@@ -64,7 +61,7 @@ function AdminDashboard({
         </div>
       </section>
 
-      <aside className="flex flex-col gap-4 xl:min-h-0 xl:overflow-hidden">
+      <aside className="flex flex-col gap-4 xl:min-h-0">
         <UploadPanel
           currentUser={currentUser}
           uploadVisibilityScope={uploadVisibilityScope}
@@ -73,22 +70,27 @@ function AdminDashboard({
           totalCount={documents.length}
         />
 
-        <section className="rounded-[28px] border border-white/10 bg-slate-900/75 p-5 shadow-2xl shadow-slate-950/40 backdrop-blur-xl xl:min-h-0 xl:flex-1 xl:overflow-y-auto">
-          <p className="text-xs uppercase tracking-[0.28em] text-slate-400">Admin profile</p>
-          <h2 className="mt-2 text-xl font-semibold text-white">{currentUser.name}</h2>
-          <p className="mt-2 text-sm text-slate-400">
-            Full control across all uploaded files, visibility settings, and document deletion.
+        <section className="rounded-3xl border border-white/10 bg-[#171717] p-4">
+          <h2 className="text-sm font-medium text-white">{currentUser.name}</h2>
+          <p className="mt-2 text-sm text-zinc-400">
+            Admin access for document upload, visibility control, and cleanup.
           </p>
 
-          <div className="mt-5 grid gap-3">
-            <div className="rounded-[22px] border border-white/10 bg-white/[0.04] p-4">
-              <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Total files</p>
-              <p className="mt-2 text-3xl font-semibold text-white">{documents.length}</p>
+          <div className="mt-4 space-y-3">
+            <div className="rounded-2xl border border-white/10 bg-[#212121] p-4">
+              <p className="text-xs text-zinc-500">Total files</p>
+              <p className="mt-2 text-2xl font-medium text-white">{documents.length}</p>
             </div>
-            <div className="rounded-[22px] border border-white/10 bg-white/[0.04] p-4">
-              <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Private files</p>
-              <p className="mt-2 text-3xl font-semibold text-white">
+            <div className="rounded-2xl border border-white/10 bg-[#212121] p-4">
+              <p className="text-xs text-zinc-500">Private files</p>
+              <p className="mt-2 text-2xl font-medium text-white">
                 {documents.filter((document) => document.visibilityScope === 'private').length}
+              </p>
+            </div>
+            <div className="rounded-2xl border border-white/10 bg-[#212121] p-4">
+              <p className="text-xs text-zinc-500">Shared files</p>
+              <p className="mt-2 text-2xl font-medium text-white">
+                {documents.filter((document) => document.visibilityScope === 'both').length}
               </p>
             </div>
           </div>

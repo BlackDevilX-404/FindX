@@ -1,12 +1,16 @@
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 from dotenv import load_dotenv
-from pymongo import ASCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.collection import Collection
 from pymongo.database import Database
 
-from auth import hash_password
+try:
+    from .auth import ROLE_ADMIN, ROLE_DEVELOPER, ROLE_HR, hash_password
+except ImportError:
+    from auth import ROLE_ADMIN, ROLE_DEVELOPER, ROLE_HR, hash_password
 
 load_dotenv()
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -18,44 +22,71 @@ client = MongoClient(MONGODB_URI)
 db: Database = client[MONGODB_DB_NAME]
 
 users_col: Collection = db["users"]
-sessions_col: Collection = db["sessions"]
 documents_col: Collection = db["documents"]
+query_logs_col: Collection = db["query_logs"]
+
+LEGACY_USER_MAPPING = {
+    "admin@findx.ai": {"username": "admin", "role": ROLE_ADMIN},
+    "hr@findx.ai": {"username": "hr", "role": ROLE_HR},
+    "employee@findx.ai": {"username": "developer", "role": ROLE_DEVELOPER},
+    "developer@findx.ai": {"username": "developer", "role": ROLE_DEVELOPER},
+}
 
 
 def ensure_indexes() -> None:
+    users_col.create_index([("username", ASCENDING)], unique=True)
     users_col.create_index([("email", ASCENDING)], unique=True)
-    sessions_col.create_index([("user_email", ASCENDING)])
-    documents_col.create_index([("ownerId", ASCENDING)])
+    documents_col.create_index([("document_id", ASCENDING)], unique=True)
+    documents_col.create_index([("category", ASCENDING)])
+    documents_col.create_index([("uploaded_by", ASCENDING)])
+    query_logs_col.create_index([("username", ASCENDING)])
+    query_logs_col.create_index([("timestamp", DESCENDING)])
+
+
+def migrate_legacy_users() -> None:
+    for email, updates in LEGACY_USER_MAPPING.items():
+        users_col.update_many(
+            {"email": email},
+            {"$set": updates},
+        )
+
+    users_without_username = list(users_col.find({"username": {"$exists": False}}))
+    for user in users_without_username:
+        fallback_email = str(user.get("email", "")).strip().lower()
+        fallback_username = fallback_email.split("@", 1)[0] if fallback_email else str(user.get("id") or user["_id"])
+        users_col.update_one(
+            {"_id": user["_id"]},
+            {
+                "$set": {
+                    "username": fallback_username,
+                    "role": user.get("role", ROLE_DEVELOPER),
+                }
+            },
+        )
 
 
 def _demo_users() -> list[dict[str, Any]]:
     return [
         {
             "id": "admin-user",
-            "name": "Aarav Patel",
+            "username": "admin",
             "email": "admin@findx.ai",
             "password": hash_password("admin123"),
-            "role": "Admin",
-            "department": "Platform Security",
-            "is_demo_user": True,
+            "role": ROLE_ADMIN,
         },
         {
             "id": "hr-user",
-            "name": "Meera Shah",
+            "username": "hr",
             "email": "hr@findx.ai",
             "password": hash_password("hr123"),
-            "role": "HR",
-            "department": "People Operations",
-            "is_demo_user": True,
+            "role": ROLE_HR,
         },
         {
-            "id": "employee-user",
-            "name": "Rohan Singh",
-            "email": "employee@findx.ai",
-            "password": hash_password("employee123"),
-            "role": "Employee",
-            "department": "Product Design",
-            "is_demo_user": True,
+            "id": "developer-user",
+            "username": "developer",
+            "email": "developer@findx.ai",
+            "password": hash_password("developer123"),
+            "role": ROLE_DEVELOPER,
         },
     ]
 
@@ -63,17 +94,52 @@ def _demo_users() -> list[dict[str, Any]]:
 def seed_demo_users() -> None:
     for user in _demo_users():
         users_col.update_one(
-            {"email": user["email"]},
-            {
-                "$setOnInsert": user,
-            },
+            {"username": user["username"]},
+            {"$setOnInsert": user},
             upsert=True,
         )
 
 
+def store_document_record(
+    document_id: str,
+    document: str,
+    category: str,
+    sensitivity: str | None,
+    uploaded_by: str,
+    chunks_indexed: int,
+) -> None:
+    documents_col.update_one(
+        {"document_id": document_id},
+        {
+            "$set": {
+                "document_id": document_id,
+                "document": document,
+                "category": category,
+                "sensitivity": sensitivity,
+                "uploaded_by": uploaded_by,
+                "chunks_indexed": chunks_indexed,
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {
+                "created_at": datetime.now(timezone.utc),
+            },
+        },
+        upsert=True,
+    )
+
+
+def log_query(username: str, role: str, query: str) -> None:
+    query_logs_col.insert_one(
+        {
+            "username": username,
+            "role": role,
+            "query": query,
+            "timestamp": datetime.now(timezone.utc),
+        }
+    )
+
+
 def bootstrap_database() -> None:
+    migrate_legacy_users()
     ensure_indexes()
     seed_demo_users()
-
-
-bootstrap_database()

@@ -18,19 +18,19 @@ export const DEMO_USERS = [
     department: 'People Operations',
   },
   {
-    id: 'employee-user',
+    id: 'developer-user',
     name: 'Rohan Singh',
-    email: 'employee@findx.ai',
-    password: 'employee123',
-    role: 'Employee',
-    department: 'Product Design',
+    email: 'developer@findx.ai',
+    password: 'developer123',
+    role: 'Developer',
+    department: 'Engineering',
   },
 ]
 
 export const VISIBILITY_OPTIONS = [
   { id: 'private', label: 'Private' },
   { id: 'hr', label: 'HR' },
-  { id: 'employee', label: 'Employees' },
+  { id: 'developer', label: 'Developers' },
   { id: 'both', label: 'Both' },
 ]
 
@@ -40,27 +40,27 @@ export function getVisibilityLabel(scope) {
 
 export const ROLE_STYLES = {
   Admin: {
-    badge: 'border-emerald-400/20 bg-emerald-500/10 text-emerald-100',
-    dot: 'bg-emerald-400',
-    soft: 'bg-emerald-500/10 text-emerald-100 border-emerald-400/20',
+    badge: 'border-emerald-300/20 bg-emerald-400/10 text-emerald-50',
+    dot: 'bg-emerald-300',
+    soft: 'bg-emerald-400/10 text-emerald-50 border-emerald-300/20',
   },
   HR: {
-    badge: 'border-fuchsia-400/20 bg-fuchsia-500/10 text-fuchsia-100',
-    dot: 'bg-fuchsia-400',
-    soft: 'bg-fuchsia-500/10 text-fuchsia-100 border-fuchsia-400/20',
+    badge: 'border-amber-300/20 bg-amber-300/10 text-amber-50',
+    dot: 'bg-amber-300',
+    soft: 'bg-amber-300/10 text-amber-50 border-amber-300/20',
   },
-  Employee: {
-    badge: 'border-blue-400/20 bg-blue-500/10 text-blue-100',
-    dot: 'bg-blue-400',
-    soft: 'bg-blue-500/10 text-blue-100 border-blue-400/20',
+  Developer: {
+    badge: 'border-cyan-300/20 bg-cyan-400/10 text-cyan-50',
+    dot: 'bg-cyan-300',
+    soft: 'bg-cyan-400/10 text-cyan-50 border-cyan-300/20',
   },
 }
 
 export const SUGGESTED_QUERIES = {
-  Employee: [
-    'How many annual leaves do employees receive?',
-    'What is the remote work reimbursement policy?',
-    'Can I carry forward unused leave?',
+  Developer: [
+    'What engineering documents can I access?',
+    'Summarize the technical onboarding guidance.',
+    'Which policy covers remote work reimbursement?',
   ],
   HR: [
     'Summarize the maternity leave eligibility rule.',
@@ -99,7 +99,7 @@ export const INITIAL_DOCUMENTS = [
     id: 'doc-3',
     name: 'Remote_Work_Policy.pdf',
     type: 'PDF',
-    ownerId: 'employee-user',
+    ownerId: 'developer-user',
     ownerName: 'Rohan Singh',
     uploadedAt: 'Yesterday',
     visibilityScope: 'both',
@@ -319,7 +319,7 @@ export function getDefaultUploadVisibility(user) {
     return 'both'
   }
 
-  return user.role === 'HR' ? 'hr' : 'employee'
+  return user.role === 'HR' ? 'hr' : 'developer'
 }
 
 export function normalizeVisibilityScope(scope) {
@@ -366,10 +366,10 @@ export function getAccessibleDocuments(documents, user) {
     switch (document.visibilityScope) {
       case 'hr':
         return user.role === 'HR'
-      case 'employee':
-        return user.role === 'Employee'
+      case 'developer':
+        return user.role === 'Developer' || user.role === 'Employee'
       case 'both':
-        return user.role === 'HR' || user.role === 'Employee'
+        return user.role === 'HR' || user.role === 'Developer' || user.role === 'Employee'
       default:
         return false
     }

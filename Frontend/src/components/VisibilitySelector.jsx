@@ -8,7 +8,7 @@ function VisibilitySelector({
 }) {
   return (
     <div>
-      <p className="text-xs uppercase tracking-[0.22em] text-slate-500">{title}</p>
+      <p className="text-xs uppercase tracking-[0.2em] text-zinc-500">{title}</p>
       <div className="mt-3 flex flex-wrap gap-2">
         {VISIBILITY_OPTIONS.map((option) => {
           const isActive = value === option.id
@@ -21,9 +21,9 @@ function VisibilitySelector({
               disabled={!interactive}
               className={`rounded-full border px-3 py-2 text-xs transition ${
                 isActive
-                  ? 'border-blue-300/40 bg-blue-500/10 text-blue-100'
-                  : 'border-white/10 bg-white/[0.04] text-slate-300'
-              } ${interactive ? 'hover:bg-white/[0.08]' : 'cursor-not-allowed opacity-80'}`}
+                  ? 'border-white/20 bg-[#2f2f2f] text-white'
+                  : 'border-white/10 bg-[#212121] text-zinc-300'
+              } ${interactive ? 'hover:bg-[#2a2a2a]' : 'cursor-not-allowed opacity-70'}`}
             >
               {option.label}
             </button>
