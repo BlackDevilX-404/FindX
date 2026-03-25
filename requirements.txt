@@ -1,0 +1,17 @@
+chromadb
+sentence-transformers
+transformers
+PyMuPDF
+Pillow
+fastapi
+uvicorn
+torch
+langchain
+langchain-groq
+python-dotenv
+uuid
+pymongo
+PyJWT
+python-multipart
+email-validator
+aspose.slides
