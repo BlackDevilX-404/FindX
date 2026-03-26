@@ -95,17 +95,17 @@ function InputBox({ input, onInputChange, onSubmit, isTyping }) {
   }
 
   return (
-    <div className="border-t border-white/10 px-4 py-4">
-      <div className="mx-auto flex max-w-3xl flex-col gap-2 rounded-[28px] border border-white/10 bg-[#2a2a2a] p-3">
+    <div className="border-t border-[var(--border-soft)] px-4 py-4">
+      <div className="mx-auto flex max-w-3xl flex-col gap-2 rounded-[30px] border border-[var(--border-soft)] bg-[var(--surface-2)] p-3 shadow-[0_14px_30px_rgba(0,0,0,0.18)]">
         <div className="flex items-end gap-3">
           <button
             type="button"
             onClick={handleMicClick}
             disabled={isTyping}
-            className={`hidden h-11 w-11 shrink-0 items-center justify-center rounded-full border text-zinc-200 transition sm:inline-flex ${
+            className={`hidden h-11 w-11 shrink-0 items-center justify-center rounded-full border text-[var(--text-main)] sm:inline-flex ${
               isListening
-                ? 'border-white/20 bg-[#3a3a3a]'
-                : 'border-white/10 bg-[#212121] hover:bg-[#303030]'
+                ? 'border-[var(--border-strong)] bg-[var(--surface-3)]'
+                : 'border-[var(--border-soft)] bg-[var(--surface-1)] hover:bg-[var(--surface-3)]'
             } disabled:cursor-not-allowed disabled:opacity-50`}
             aria-label={isListening ? 'Stop voice input' : 'Start voice input'}
             title={
@@ -124,15 +124,15 @@ function InputBox({ input, onInputChange, onSubmit, isTyping }) {
             onChange={(event) => onInputChange(event.target.value)}
             onKeyDown={handleKeyDown}
             rows={1}
-            placeholder="Message FindX"
-            className="max-h-40 min-h-[44px] flex-1 resize-none bg-transparent px-1 py-2 text-sm text-white outline-none placeholder:text-zinc-500"
+            placeholder="Ask about policies, files, or teams"
+            className="max-h-40 min-h-[44px] flex-1 resize-none bg-transparent px-1 py-2 text-sm text-[var(--text-main)] outline-none placeholder:text-[var(--text-muted)]"
           />
 
           <button
             type="button"
             onClick={() => onSubmit(input)}
             disabled={isTyping || !input.trim()}
-            className="inline-flex h-11 shrink-0 items-center justify-center rounded-full bg-white px-4 text-sm font-medium text-black transition hover:bg-zinc-200 disabled:cursor-not-allowed disabled:bg-zinc-600"
+            className="inline-flex h-11 shrink-0 items-center justify-center rounded-full bg-[var(--text-main)] px-4 text-sm font-semibold text-[#17120f] hover:bg-[#fff8ef] disabled:cursor-not-allowed disabled:bg-zinc-600"
           >
             Send
           </button>

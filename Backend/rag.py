@@ -34,11 +34,17 @@ ROLE_CATEGORY_ACCESS = {
     ROLE_HR: ["HR", "GENERAL"],
     ROLE_DEVELOPER: ["TECH", "GENERAL"],
 }
+ROLE_VISIBILITY_ACCESS = {
+    ROLE_ADMIN: ["private", "hr", "developer", "both"],
+    ROLE_HR: ["hr", "both"],
+    ROLE_DEVELOPER: ["developer", "both"],
+}
 VALID_CATEGORIES = sorted({category for values in ROLE_CATEGORY_ACCESS.values() for category in values})
 CATEGORY_VARIANTS = {
     category: {category, category.lower(), category.title()}
     for category in VALID_CATEGORIES
 }
+VALID_VISIBILITY_SCOPES = ["private", "hr", "developer", "both"]
 
 WORD_PATTERN = re.compile(r"[a-zA-Z0-9]+")
 STOP_WORDS = {
@@ -214,6 +220,10 @@ def allowed_categories_for_role(role: str) -> list[str]:
     return ROLE_CATEGORY_ACCESS.get(normalize_role(role), [])
 
 
+def allowed_visibility_scopes_for_role(role: str) -> list[str]:
+    return ROLE_VISIBILITY_ACCESS.get(normalize_role(role), [])
+
+
 def validate_category(category: str) -> str:
     normalized = normalize_category_value(category)
     if normalized not in VALID_CATEGORIES:
@@ -221,10 +231,30 @@ def validate_category(category: str) -> str:
     return normalized
 
 
+def normalize_visibility_scope(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in VALID_VISIBILITY_SCOPES else "private"
+
+
+def validate_visibility_scope(scope: str) -> str:
+    normalized = str(scope or "").strip().lower()
+    if normalized not in VALID_VISIBILITY_SCOPES:
+        raise ValueError(
+            f"Invalid visibility scope '{scope}'. Allowed values: {', '.join(VALID_VISIBILITY_SCOPES)}"
+        )
+    return normalized
+
+
 def category_matches_allowed(value: Any, allowed_categories: list[str]) -> bool:
     if not allowed_categories:
         return False
     return normalize_category_value(value) in {category.upper() for category in allowed_categories}
+
+
+def visibility_matches_allowed(value: Any, allowed_scopes: list[str]) -> bool:
+    if not allowed_scopes:
+        return False
+    return normalize_visibility_scope(value) in {scope.lower() for scope in allowed_scopes}
 
 
 def build_category_where_filter(allowed_categories: list[str]) -> dict[str, Any]:
@@ -236,6 +266,12 @@ def build_category_where_filter(allowed_categories: list[str]) -> dict[str, Any]
         }
     )
     return {"category": {"$in": category_values}}
+
+
+def build_access_where_filter(allowed_categories: list[str], allowed_visibility_scopes: list[str]) -> dict[str, Any]:
+    category_filter = build_category_where_filter(allowed_categories)
+    visibility_filter = {"visibility_scope": {"$in": sorted({scope.lower() for scope in allowed_visibility_scopes})}}
+    return {"$and": [category_filter, visibility_filter]}
 
 
 def format_confidence(score: float) -> str:
@@ -419,9 +455,11 @@ class EnterpriseRAGService:
         document_name: str,
         category: str,
         sensitivity: str | None,
+        visibility_scope: str,
         uploaded_by: str,
     ) -> IngestResult:
         validated_category = validate_category(category)
+        validated_visibility_scope = validate_visibility_scope(visibility_scope)
         pages = self._extract_pages_from_file(file_path)
         chunks = self._chunk_pages(pages)
 
@@ -448,6 +486,7 @@ class EnterpriseRAGService:
                         "document": document_name,
                         "category": validated_category,
                         "sensitivity": sensitivity,
+                        "visibility_scope": validated_visibility_scope,
                         "page": chunk["page"],
                         "uploaded_by": uploaded_by,
                     }
@@ -637,10 +676,11 @@ class EnterpriseRAGService:
 
         return planned_queries
 
-    def _filter_results_by_allowed_categories(
+    def _filter_results_by_access(
         self,
         results: dict[str, Any],
         allowed_categories: list[str],
+        allowed_visibility_scopes: list[str],
     ) -> dict[str, list[list[Any]]]:
         documents = (results.get("documents") or [[]])[0]
         metadatas = (results.get("metadatas") or [[]])[0]
@@ -651,7 +691,11 @@ class EnterpriseRAGService:
         filtered_distances: list[Any] = []
 
         for document_text, metadata, distance in zip(documents, metadatas, distances):
-            if not metadata or not category_matches_allowed(metadata.get("category"), allowed_categories):
+            if not metadata:
+                continue
+            if not category_matches_allowed(metadata.get("category"), allowed_categories):
+                continue
+            if not visibility_matches_allowed(metadata.get("visibility_scope"), allowed_visibility_scopes):
                 continue
             filtered_documents.append(document_text)
             filtered_metadatas.append(metadata)
@@ -665,7 +709,8 @@ class EnterpriseRAGService:
 
     def _query_enterprise_chunks(self, query_text: str, role: str, top_k: int) -> list[RetrievedChunk]:
         allowed_categories = allowed_categories_for_role(role)
-        if not allowed_categories:
+        allowed_visibility_scopes = allowed_visibility_scopes_for_role(role)
+        if not allowed_categories or not allowed_visibility_scopes:
             return []
 
         query_embedding = self.embedder.encode(
@@ -678,7 +723,7 @@ class EnterpriseRAGService:
         filtered_results = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=fetch_k,
-            where=build_category_where_filter(allowed_categories),
+            where=build_access_where_filter(allowed_categories, allowed_visibility_scopes),
             include=["documents", "metadatas", "distances"],
         )
         ranked_chunks = self._rank_chunks(query_text, filtered_results, top_k=top_k)
@@ -693,11 +738,36 @@ class EnterpriseRAGService:
             n_results=fetch_k,
             include=["documents", "metadatas", "distances"],
         )
-        locally_filtered = self._filter_results_by_allowed_categories(
+        locally_filtered = self._filter_results_by_access(
             compatibility_results,
             allowed_categories=allowed_categories,
+            allowed_visibility_scopes=allowed_visibility_scopes,
         )
         return self._rank_chunks(query_text, locally_filtered, top_k=top_k)
+
+    def update_document_visibility(self, document_id: str, visibility_scope: str) -> bool:
+        validated_visibility_scope = validate_visibility_scope(visibility_scope)
+        results = self.collection.get(
+            where={"document_id": {"$eq": document_id}},
+            include=["metadatas"],
+        )
+
+        ids = results.get("ids") or []
+        metadatas = results.get("metadatas") or []
+        if not ids:
+            return False
+
+        next_metadatas = [
+            build_metadata_payload(
+                {
+                    **(metadata or {}),
+                    "visibility_scope": validated_visibility_scope,
+                }
+            )
+            for metadata in metadatas
+        ]
+        self.collection.update(ids=ids, metadatas=next_metadatas)
+        return True
 
     def _query_legacy_chunks(
         self,
@@ -881,7 +951,8 @@ class EnterpriseRAGService:
     ) -> QueryResult:
         normalized_role = normalize_role(role)
         allowed_categories = allowed_categories_for_role(normalized_role)
-        if not allowed_categories:
+        allowed_visibility_scopes = allowed_visibility_scopes_for_role(normalized_role)
+        if not allowed_categories or not allowed_visibility_scopes:
             return QueryResult(
                 answer="No accessible data found for your role",
                 explanation="Your role does not have access to any searchable document categories.",

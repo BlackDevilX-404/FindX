@@ -16,7 +16,14 @@ try:
         ROLE_ADMIN,
     )
     from .db import bootstrap_database, log_query, store_document_record
-    from .rag import EnterpriseRAGService, IngestResult, QueryResult, SourceItem
+    from .db import update_document_visibility as update_document_visibility_record
+    from .rag import (
+        EnterpriseRAGService,
+        IngestResult,
+        QueryResult,
+        SourceItem,
+        validate_visibility_scope,
+    )
 except ImportError:
     from auth import (
         LoginRequest,
@@ -29,7 +36,14 @@ except ImportError:
         ROLE_ADMIN,
     )
     from db import bootstrap_database, log_query, store_document_record
-    from rag import EnterpriseRAGService, IngestResult, QueryResult, SourceItem
+    from db import update_document_visibility as update_document_visibility_record
+    from rag import (
+        EnterpriseRAGService,
+        IngestResult,
+        QueryResult,
+        SourceItem,
+        validate_visibility_scope,
+    )
 
 bootstrap_database()
 rag_service = EnterpriseRAGService()
@@ -69,6 +83,10 @@ class UploadResponse(BaseModel):
     category: str
     sensitivity: str | None = None
     chunks_indexed: int
+
+
+class VisibilityUpdateRequest(BaseModel):
+    visibility_scope: str = Field(...)
 
 
 def _resolve_query_scope(request: QueryRequest, current_user: dict[str, Any]) -> str | None:
@@ -125,6 +143,7 @@ async def upload_document(
     file: UploadFile = File(...),
     category: str = Form("GENERAL"),
     sensitivity: str | None = Form(None),
+    visibility_scope: str = Form("private"),
     session_id: str | None = Form(None),
     current_user: dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
 ):
@@ -139,6 +158,7 @@ async def upload_document(
             document_name=file.filename,
             category=category,
             sensitivity=sensitivity,
+            visibility_scope=visibility_scope,
             uploaded_by=current_user["username"],
         )
     except ValueError as exc:
@@ -151,10 +171,31 @@ async def upload_document(
         document=result.document,
         category=result.category,
         sensitivity=result.sensitivity,
+        visibility_scope=validate_visibility_scope(visibility_scope),
         uploaded_by=current_user["username"],
         chunks_indexed=result.chunks_indexed,
     )
     return _build_upload_response(result)
+
+
+@app.patch("/api/documents/{document_id}/visibility")
+async def update_document_visibility(
+    document_id: str,
+    request: VisibilityUpdateRequest,
+    current_user: dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
+):
+    normalized_scope = validate_visibility_scope(request.visibility_scope)
+    updated_in_index = rag_service.update_document_visibility(document_id, normalized_scope)
+    updated_in_db = update_document_visibility_record(document_id, normalized_scope)
+
+    if not updated_in_index and not updated_in_db:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {
+        "document_id": document_id,
+        "visibility_scope": normalized_scope,
+        "message": "Document visibility updated successfully",
+    }
 
 
 @app.post("/query", response_model=QueryResponse)

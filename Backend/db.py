@@ -28,7 +28,12 @@ query_logs_col: Collection = db["query_logs"]
 LEGACY_USER_MAPPING = {
     "admin@findx.ai": {"username": "admin", "role": ROLE_ADMIN},
     "hr@findx.ai": {"username": "hr", "role": ROLE_HR},
-    "employee@findx.ai": {"username": "developer", "role": ROLE_DEVELOPER},
+    "employee@findx.ai": {
+        "username": "developer",
+        "role": ROLE_DEVELOPER,
+        "email": "developer@findx.ai",
+        "id": "developer-user",
+    },
     "developer@findx.ai": {"username": "developer", "role": ROLE_DEVELOPER},
 }
 
@@ -49,6 +54,17 @@ def migrate_legacy_users() -> None:
             {"email": email},
             {"$set": updates},
         )
+
+    users_col.update_many(
+        {"username": "developer"},
+        {
+            "$set": {
+                "email": "developer@findx.ai",
+                "id": "developer-user",
+                "role": ROLE_DEVELOPER,
+            }
+        },
+    )
 
     users_without_username = list(users_col.find({"username": {"$exists": False}}))
     for user in users_without_username:
@@ -105,6 +121,7 @@ def store_document_record(
     document: str,
     category: str,
     sensitivity: str | None,
+    visibility_scope: str,
     uploaded_by: str,
     chunks_indexed: int,
 ) -> None:
@@ -116,6 +133,7 @@ def store_document_record(
                 "document": document,
                 "category": category,
                 "sensitivity": sensitivity,
+                "visibility_scope": visibility_scope,
                 "uploaded_by": uploaded_by,
                 "chunks_indexed": chunks_indexed,
                 "updated_at": datetime.now(timezone.utc),
@@ -126,6 +144,19 @@ def store_document_record(
         },
         upsert=True,
     )
+
+
+def update_document_visibility(document_id: str, visibility_scope: str) -> bool:
+    result = documents_col.update_one(
+        {"document_id": document_id},
+        {
+            "$set": {
+                "visibility_scope": visibility_scope,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+    return result.matched_count > 0
 
 
 def log_query(username: str, role: str, query: str) -> None:

@@ -2,14 +2,20 @@
 
 :root {
   color-scheme: dark;
-  font-family:
-    ui-sans-serif,
-    system-ui,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
-  background: #212121;
+  font-family: "Manrope", "Segoe UI", system-ui, sans-serif;
+  background:
+    radial-gradient(circle at top, rgba(191, 140, 92, 0.12), transparent 28%),
+    linear-gradient(180deg, #181512 0%, #11100f 100%);
+  --surface-0: #11100f;
+  --surface-1: rgba(28, 25, 22, 0.88);
+  --surface-2: rgba(41, 37, 33, 0.92);
+  --surface-3: rgba(60, 53, 46, 0.92);
+  --border-soft: rgba(219, 197, 167, 0.12);
+  --border-strong: rgba(219, 197, 167, 0.24);
+  --text-main: #f7f0e8;
+  --text-muted: #c1b4a5;
+  --accent: #c98d58;
+  --accent-soft: rgba(201, 141, 88, 0.18);
 }
 
 * {
@@ -24,8 +30,10 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background: #212121;
-  color: #ececec;
+  background:
+    radial-gradient(circle at top, rgba(191, 140, 92, 0.12), transparent 28%),
+    linear-gradient(180deg, #181512 0%, #11100f 100%);
+  color: var(--text-main);
 }
 
 button,
@@ -35,30 +43,42 @@ textarea {
   font: inherit;
 }
 
+button,
+input,
+textarea,
+select {
+  transition:
+    border-color 160ms ease,
+    background-color 160ms ease,
+    color 160ms ease,
+    box-shadow 160ms ease,
+    transform 160ms ease;
+}
+
 #root {
   min-height: 100vh;
 }
 
 ::selection {
-  background: rgba(255, 255, 255, 0.18);
-  color: #ffffff;
+  background: rgba(201, 141, 88, 0.28);
+  color: #fff8ef;
 }
 
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 11px;
+  height: 11px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #1a1a1a;
+  background: rgba(17, 16, 15, 0.92);
 }
 
 ::-webkit-scrollbar-thumb {
   border-radius: 999px;
-  background: #4a4a4a;
-  border: 2px solid #1a1a1a;
+  background: rgba(114, 96, 76, 0.92);
+  border: 2px solid rgba(17, 16, 15, 0.92);
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #5a5a5a;
+  background: rgba(145, 121, 96, 0.96);
 }

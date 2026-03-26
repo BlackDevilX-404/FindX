@@ -77,10 +77,11 @@ export function sendChatMessage({ token, query, chatId, chatHistory }) {
   })
 }
 
-export function uploadFileToSession({ token, sessionId, file }) {
+export function uploadFileToSession({ token, sessionId, file, visibilityScope }) {
   const formData = new FormData()
   formData.append('session_id', sessionId)
   formData.append('file', file)
+  formData.append('visibility_scope', visibilityScope)
 
   return apiRequest('/api/upload/file', {
     method: 'POST',
@@ -88,5 +89,18 @@ export function uploadFileToSession({ token, sessionId, file }) {
       Authorization: `Bearer ${token}`,
     },
     body: formData,
+  })
+}
+
+export function updateDocumentVisibility({ token, documentId, visibilityScope }) {
+  return apiRequest(`/api/documents/${documentId}/visibility`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      visibility_scope: visibilityScope,
+    }),
   })
 }

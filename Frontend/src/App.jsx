@@ -10,6 +10,7 @@ import {
   loginUser,
   sendChatMessage,
   storeToken,
+  updateDocumentVisibility,
   uploadFileToSession,
 } from './lib/api'
 import LoginPage from './components/LoginPage'
@@ -87,6 +88,7 @@ function normalizeDocuments(documents) {
         document.uploaded_by ??
         document.owner ??
         'Unknown owner',
+      isSynced: document.isSynced ?? Boolean(document.document_id ?? document.id),
       summary:
         document.summary ??
         `Indexed ${document.chunks_indexed ?? 0} chunk(s) in ${document.category ?? 'GENERAL'} category.`,
@@ -170,6 +172,7 @@ function buildUploadedDocument(result, currentUser) {
     summary: `Indexed ${result?.chunks_indexed ?? 0} chunk(s) in ${result?.category ?? 'GENERAL'} category.`,
     category: result?.category ?? 'GENERAL',
     sensitivity: result?.sensitivity ?? null,
+    isSynced: true,
   }
 }
 
@@ -551,6 +554,7 @@ function App() {
             token: authToken,
             sessionId: getBackendSessionId(currentUser),
             file,
+            visibilityScope: uploadVisibilityScope,
           }),
         ),
       )
@@ -575,23 +579,43 @@ function App() {
     event.target.value = ''
   }
 
-  const handleDocumentVisibilityChange = (documentId, scope) => {
-    if (!currentUser) {
+  const handleDocumentVisibilityChange = async (documentId, scope) => {
+    if (!currentUser || !authToken) {
       return
     }
 
-    setDocuments((current) =>
-      current.map((document) => {
-        if (document.id !== documentId || !canEditDocumentVisibility(document, currentUser)) {
-          return document
-        }
+    const normalizedScope = normalizeVisibilityScope(scope)
+    const targetDocument = documents.find((document) => document.id === documentId)
 
-        return {
-          ...document,
-          visibilityScope: normalizeVisibilityScope(scope),
-        }
-      }),
-    )
+    if (!targetDocument || !canEditDocumentVisibility(targetDocument, currentUser)) {
+      return
+    }
+
+    try {
+      if (targetDocument.isSynced) {
+        await updateDocumentVisibility({
+          token: authToken,
+          documentId,
+          visibilityScope: normalizedScope,
+        })
+      }
+
+      setDocuments((current) =>
+        current.map((document) => {
+          if (document.id !== documentId || !canEditDocumentVisibility(document, currentUser)) {
+            return document
+          }
+
+          return {
+            ...document,
+            visibilityScope: normalizedScope,
+          }
+        }),
+      )
+      setUploadError('')
+    } catch (error) {
+      setUploadError(error.message || 'Visibility update failed.')
+    }
   }
 
   const handleDeleteDocument = (documentId) => {
@@ -610,9 +634,9 @@ function App() {
 
   if (isAuthLoading) {
     return (
-      <div className="min-h-screen bg-[#212121] text-white">
-        <div className="flex min-h-screen items-center justify-center px-4 text-sm text-zinc-400">
-          Restoring your session...
+      <div className="min-h-screen text-[var(--text-main)]">
+        <div className="flex min-h-screen items-center justify-center px-4 text-sm text-[var(--text-muted)]">
+          Restoring your workspace...
         </div>
       </div>
     )
@@ -620,7 +644,7 @@ function App() {
 
   if (!currentUser) {
     return (
-      <div className="min-h-screen bg-[#212121] text-white">
+      <div className="min-h-screen text-[var(--text-main)]">
         <LoginPage
           form={loginForm}
           onChange={handleLoginChange}
@@ -633,7 +657,7 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen bg-[#212121] text-white xl:h-screen xl:overflow-hidden">
+    <div className="min-h-screen text-[var(--text-main)] xl:h-screen xl:overflow-hidden">
       <div className="mx-auto flex min-h-screen max-w-[1600px] flex-col px-4 py-4 sm:px-6 lg:px-8 xl:h-screen xl:min-h-0">
         <Navbar
           currentUser={currentUser}
@@ -648,8 +672,8 @@ function App() {
         ) : null}
 
         {isUploading ? (
-          <div className="mt-4 rounded-2xl border border-white/10 bg-[#171717] px-4 py-3 text-sm text-zinc-300">
-            Uploading and indexing files...
+          <div className="mt-4 rounded-2xl border border-[var(--border-soft)] bg-[var(--surface-1)] px-4 py-3 text-sm text-[var(--text-muted)]">
+            Uploading and indexing your files...
           </div>
         ) : null}
 
@@ -685,13 +709,13 @@ function App() {
               />
             ) : null}
 
-            <section className="flex min-h-[72vh] flex-col rounded-3xl border border-white/10 bg-[#171717] xl:min-h-0 xl:overflow-hidden">
-              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-4 py-4">
+            <section className="flex min-h-[72vh] flex-col rounded-3xl border border-[var(--border-soft)] bg-[var(--surface-1)] shadow-[0_24px_60px_rgba(0,0,0,0.16)] xl:min-h-0 xl:overflow-hidden">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--border-soft)] px-4 py-4">
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
                     onClick={() => setIsLeftSidebarOpen((current) => !current)}
-                    className="rounded-full border border-white/10 bg-[#212121] px-3 py-2 text-xs text-zinc-300 transition hover:bg-[#2a2a2a]"
+                    className="rounded-full border border-[var(--border-soft)] bg-[var(--surface-2)] px-3 py-2 text-xs text-[var(--text-main)] hover:border-[var(--border-strong)] hover:bg-[var(--surface-3)]"
                   >
                     {isLeftSidebarOpen ? 'Hide history' : 'Show history'}
                   </button>
@@ -699,15 +723,16 @@ function App() {
                   <button
                     type="button"
                     onClick={() => setIsRightSidebarOpen((current) => !current)}
-                    className="rounded-full border border-white/10 bg-[#212121] px-3 py-2 text-xs text-zinc-300 transition hover:bg-[#2a2a2a]"
+                    className="rounded-full border border-[var(--border-soft)] bg-[var(--surface-2)] px-3 py-2 text-xs text-[var(--text-main)] hover:border-[var(--border-strong)] hover:bg-[var(--surface-3)]"
                   >
                     {isRightSidebarOpen ? 'Hide evidence' : 'Show evidence'}
                   </button>
                 </div>
 
-                <p className="text-sm text-zinc-400">
-                  {activeConversation?.title ?? 'New chat'}
-                </p>
+                <div className="text-right">
+                  <p className="text-[11px] uppercase tracking-[0.24em] text-[var(--text-muted)]">Current thread</p>
+                  <p className="mt-1 text-sm text-[var(--text-main)]">{activeConversation?.title ?? 'New chat'}</p>
+                </div>
               </div>
 
               <ChatWindow
