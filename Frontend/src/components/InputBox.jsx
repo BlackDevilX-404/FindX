@@ -104,9 +104,9 @@ function InputBox({ input, onInputChange, onSubmit, isTyping }) {
             disabled={isTyping}
             className={`hidden h-11 w-11 shrink-0 items-center justify-center rounded-full border text-[var(--text-main)] sm:inline-flex ${
               isListening
-                ? 'border-[var(--border-strong)] bg-[var(--surface-3)]'
+                ? 'mic-button-active border-[var(--accent)] bg-[var(--surface-3)] text-[var(--accent)]'
                 : 'border-[var(--border-soft)] bg-[var(--surface-1)] hover:bg-[var(--surface-3)]'
-            } disabled:cursor-not-allowed disabled:opacity-50`}
+            } relative overflow-visible disabled:cursor-not-allowed disabled:opacity-50`}
             aria-label={isListening ? 'Stop voice input' : 'Start voice input'}
             title={
               isMicSupported
@@ -116,7 +116,16 @@ function InputBox({ input, onInputChange, onSubmit, isTyping }) {
                 : 'Voice input is not supported in this browser'
             }
           >
-            <MicIcon />
+            {isListening ? (
+              <span aria-hidden="true" className="pointer-events-none absolute inset-[-10px]">
+                <span className="mic-wave" />
+                <span className="mic-wave mic-wave-delay-1" />
+                <span className="mic-wave mic-wave-delay-2" />
+              </span>
+            ) : null}
+            <span className={`relative z-10 ${isListening ? 'mic-icon-active' : ''}`}>
+              <MicIcon />
+            </span>
           </button>
 
           <textarea

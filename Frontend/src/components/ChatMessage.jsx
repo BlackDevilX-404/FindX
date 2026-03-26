@@ -20,7 +20,12 @@ function ChatMessage({
   return (
     <div className="w-full">
       <div className="max-w-3xl text-sm leading-7 text-zinc-100">
-        <p className="whitespace-pre-wrap">{message.text}</p>
+        <p className="whitespace-pre-wrap">
+          {message.text}
+          {message.isStreaming ? (
+            <span className="ml-1 inline-block h-4 w-[2px] animate-pulse bg-zinc-300 align-middle" />
+          ) : null}
+        </p>
 
         {message.suggested && suggestedQueries.length ? (
           <div className="mt-4 flex flex-wrap gap-2">

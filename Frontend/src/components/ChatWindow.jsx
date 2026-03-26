@@ -9,6 +9,8 @@ function ChatWindow({
   suggestedQueries,
   chatViewportRef,
 }) {
+  const hasStreamingMessage = messages.some((message) => message.isStreaming)
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div ref={chatViewportRef} className="flex-1 overflow-y-auto px-4 py-6">
@@ -30,7 +32,7 @@ function ChatWindow({
             />
           ))}
 
-          {isTyping ? (
+          {isTyping && !hasStreamingMessage ? (
             <div className="max-w-3xl text-sm text-[var(--text-muted)]">
               <div className="flex items-center gap-2">
                 <span className="h-2 w-2 animate-bounce rounded-full bg-[var(--accent)] [animation-delay:-0.3s]" />

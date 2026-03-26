@@ -77,6 +77,91 @@ export function sendChatMessage({ token, query, chatId, chatHistory }) {
   })
 }
 
+export async function sendChatMessageStream({
+  token,
+  query,
+  chatId,
+  chatHistory,
+  onEvent,
+  signal,
+}) {
+  const response = await fetch(buildUrl('/api/chat/stream'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    signal,
+    body: JSON.stringify({
+      query,
+      chat_id: chatId,
+      chat_history: chatHistory,
+    }),
+  })
+
+  if (!response.ok) {
+    const data = await parseResponse(response)
+    const detail =
+      typeof data?.detail === 'string'
+        ? data.detail
+        : 'Request failed. Please try again.'
+    throw new Error(detail)
+  }
+
+  const reader = response.body?.getReader()
+  if (!reader) {
+    throw new Error('Streaming is not supported by this browser or server response.')
+  }
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let finalEvent = null
+
+  while (true) {
+    const { value, done } = await reader.read()
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
+
+    const lines = buffer.split(/\r?\n/)
+    buffer = lines.pop() ?? ''
+
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed) {
+        continue
+      }
+
+      const event = JSON.parse(trimmed)
+      onEvent?.(event)
+
+      if (event.type === 'error') {
+        throw new Error(event.detail || 'Streaming request failed.')
+      }
+
+      if (event.type === 'final') {
+        finalEvent = event
+      }
+    }
+
+    if (done) {
+      break
+    }
+  }
+
+  const trailing = buffer.trim()
+  if (trailing) {
+    const event = JSON.parse(trailing)
+    onEvent?.(event)
+    if (event.type === 'error') {
+      throw new Error(event.detail || 'Streaming request failed.')
+    }
+    if (event.type === 'final') {
+      finalEvent = event
+    }
+  }
+
+  return finalEvent
+}
+
 export function uploadFileToSession({ token, sessionId, file, visibilityScope }) {
   const formData = new FormData()
   formData.append('session_id', sessionId)

@@ -9,7 +9,7 @@ import {
   fetchCurrentUser,
   getStoredToken,
   loginUser,
-  sendChatMessage,
+  sendChatMessageStream,
   storeToken,
   updateDocumentVisibility,
   uploadFileToSession,
@@ -227,6 +227,8 @@ function App() {
     readStorage(RIGHT_SIDEBAR_OPEN_KEY, getDefaultSidebarOpen()),
   )
   const chatViewportRef = useRef(null)
+  const activeStreamControllerRef = useRef(null)
+  const activeStreamConversationIdRef = useRef(null)
 
   const userKey = currentUser?.email.toLowerCase() ?? null
   const conversations = userKey ? chatStore[userKey] ?? [] : []
@@ -237,6 +239,8 @@ function App() {
         conversations[0] ??
         null
       : null
+  const activeMessages = activeConversation?.messages ?? []
+  const lastMessage = activeMessages[activeMessages.length - 1] ?? null
   const suggestedQueries = currentUser ? SUGGESTED_QUERIES[currentUser.role] ?? [] : []
 
   useEffect(() => {
@@ -335,9 +339,15 @@ function App() {
 
     chatViewportRef.current.scrollTo({
       top: chatViewportRef.current.scrollHeight,
-      behavior: 'smooth',
+      behavior: lastMessage?.isStreaming ? 'auto' : 'smooth',
     })
-  }, [activeConversation?.messages?.length, activeConversationId, isTyping])
+  }, [
+    activeMessages.length,
+    activeConversationId,
+    isTyping,
+    lastMessage?.isStreaming,
+    lastMessage?.text,
+  ])
 
   useEffect(() => {
     if (!activeConversation) {
@@ -364,6 +374,29 @@ function App() {
         [userKey]: sortConversations(updater(existing)),
       }
     })
+  }
+
+  const patchConversationMessage = (
+    conversationId,
+    messageId,
+    updater,
+    nextUpdatedAt = null,
+  ) => {
+    updateUserConversations((existing) =>
+      existing.map((conversation) => {
+        if (conversation.id !== conversationId) {
+          return conversation
+        }
+
+        return {
+          ...conversation,
+          updatedAt: nextUpdatedAt ?? conversation.updatedAt,
+          messages: conversation.messages.map((message) =>
+            message.id === messageId ? updater(message) : message,
+          ),
+        }
+      }),
+    )
   }
 
   const handleLoginChange = (partialForm) => {
@@ -397,6 +430,9 @@ function App() {
   }
 
   const handleLogout = () => {
+    activeStreamControllerRef.current?.abort()
+    activeStreamControllerRef.current = null
+    activeStreamConversationIdRef.current = null
     clearStoredToken()
     setAuthToken('')
     setCurrentUser(null)
@@ -418,6 +454,31 @@ function App() {
     setActiveConversationId(newConversation.id)
     setSelectedSource(null)
     setInput('')
+  }
+
+  const handleDeleteConversation = (conversationId) => {
+    if (!userKey || !currentUser || currentUser.role === 'Admin') {
+      return
+    }
+
+    if (activeStreamConversationIdRef.current === conversationId) {
+      activeStreamControllerRef.current?.abort()
+      activeStreamControllerRef.current = null
+      activeStreamConversationIdRef.current = null
+      setIsTyping(false)
+    }
+
+    let nextActiveConversationId = null
+    updateUserConversations((existing) => {
+      const remaining = existing.filter((conversation) => conversation.id !== conversationId)
+      nextActiveConversationId = remaining[0]?.id ?? null
+      return remaining
+    })
+
+    if (activeConversationId === conversationId) {
+      setActiveConversationId(nextActiveConversationId)
+      setSelectedSource(null)
+    }
   }
 
   const ensureConversation = () => {
@@ -471,71 +532,111 @@ function App() {
     )
 
     setIsTyping(true)
+    const assistantMessageId = crypto.randomUUID()
+    const assistantCreatedAt = new Date().toISOString()
+    updateUserConversations((existing) =>
+      existing.map((conversation) =>
+        conversation.id === conversationId
+          ? {
+              ...conversation,
+              updatedAt: assistantCreatedAt,
+              messages: [
+                ...conversation.messages,
+                {
+                  id: assistantMessageId,
+                  type: 'assistant',
+                  kind: 'response',
+                  text: '',
+                  explanation: 'Finding the strongest evidence...',
+                  sources: [],
+                  createdAt: assistantCreatedAt,
+                  isStreaming: true,
+                },
+              ],
+            }
+          : conversation,
+      ),
+    )
 
     try {
-      const response = await sendChatMessage({
+      const streamController = new AbortController()
+      activeStreamControllerRef.current = streamController
+      activeStreamConversationIdRef.current = conversationId
+      let streamedText = ''
+      const finalResponse = await sendChatMessageStream({
         token: authToken,
         query,
         chatId: getBackendSessionId(currentUser),
         chatHistory: formatChatHistory(existingConversation?.messages ?? []),
+        signal: streamController.signal,
+        onEvent: (event) => {
+          if (event.type === 'token') {
+            streamedText += event.delta ?? ''
+            patchConversationMessage(
+              conversationId,
+              assistantMessageId,
+              (message) => ({
+                ...message,
+                text: streamedText,
+              }),
+            )
+            return
+          }
+
+          if (event.type === 'final') {
+            const sources = Array.isArray(event.sources)
+              ? event.sources.map((source, index) => normalizeSource(source, index, assistantMessageId))
+              : []
+
+            patchConversationMessage(
+              conversationId,
+              assistantMessageId,
+              (message) => ({
+                ...message,
+                text: event.answer || streamedText || message.text,
+                explanation:
+                  event.explanation ||
+                  'This answer is grounded in the document evidence selected by the backend agent.',
+                sources,
+                isStreaming: false,
+              }),
+              new Date().toISOString(),
+            )
+
+            if (sources.length) {
+              setSelectedSource(sources[0])
+              setIsRightSidebarOpen(true)
+            }
+          }
+        },
       })
-      const assistantMessageId = crypto.randomUUID()
-      const sources = Array.isArray(response.sources)
-        ? response.sources.map((source, index) => normalizeSource(source, index, assistantMessageId))
-        : []
 
-      const assistantMessage = {
-        id: assistantMessageId,
-        type: 'assistant',
-        kind: 'response',
-        text: response.answer,
-        explanation:
-          response.explanation ||
-          'This answer is grounded in the document evidence selected by the backend agent.',
-        sources,
-        createdAt: new Date().toISOString(),
-      }
-
-      updateUserConversations((existing) =>
-        existing.map((conversation) =>
-          conversation.id === conversationId
-            ? {
-                ...conversation,
-                updatedAt: assistantMessage.createdAt,
-                messages: [...conversation.messages, assistantMessage],
-              }
-            : conversation,
-        ),
-      )
-
-      if (sources.length) {
-        setSelectedSource(sources[0])
-        setIsRightSidebarOpen(true)
+      if (!finalResponse) {
+        throw new Error('The backend stream ended before the final answer arrived.')
       }
     } catch (error) {
-      const errorMessage = {
-        id: crypto.randomUUID(),
-        type: 'assistant',
-        kind: 'response',
-        text: error.message || 'The backend could not answer this query.',
-        explanation:
-          'The request reached the server, but the backend agent could not complete retrieval or grounded generation.',
-        sources: [],
-        createdAt: new Date().toISOString(),
+      if (error.name === 'AbortError') {
+        return
       }
 
-      updateUserConversations((existing) =>
-        existing.map((conversation) =>
-          conversation.id === conversationId
-            ? {
-                ...conversation,
-                updatedAt: errorMessage.createdAt,
-                messages: [...conversation.messages, errorMessage],
-              }
-            : conversation,
-        ),
+      patchConversationMessage(
+        conversationId,
+        assistantMessageId,
+        (message) => ({
+          ...message,
+          text: error.message || 'The backend could not answer this query.',
+          explanation:
+            'The request reached the server, but the backend agent could not complete retrieval or grounded generation.',
+          sources: [],
+          isStreaming: false,
+        }),
+        new Date().toISOString(),
       )
     } finally {
+      if (activeStreamConversationIdRef.current === conversationId) {
+        activeStreamControllerRef.current = null
+        activeStreamConversationIdRef.current = null
+      }
       setIsTyping(false)
     }
   }
@@ -720,6 +821,7 @@ function App() {
                 conversations={conversations}
                 activeConversationId={activeConversation?.id}
                 onConversationSelect={setActiveConversationId}
+                onDeleteConversation={handleDeleteConversation}
                 onNewChat={handleNewChat}
                 uploadVisibilityScope={uploadVisibilityScope}
                 onUploadVisibilityChange={handleUploadVisibilityChange}

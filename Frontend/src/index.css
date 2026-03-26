@@ -82,3 +82,58 @@ select {
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(145, 121, 96, 0.96);
 }
+
+.mic-button-active {
+  box-shadow:
+    0 0 0 1px rgba(201, 141, 88, 0.3),
+    0 0 24px rgba(201, 141, 88, 0.18);
+}
+
+.mic-icon-active {
+  animation: micIconBob 1.2s ease-in-out infinite;
+}
+
+.mic-wave {
+  position: absolute;
+  inset: 0;
+  border: 1px solid rgba(201, 141, 88, 0.52);
+  border-radius: 9999px;
+  opacity: 0;
+  transform: scale(0.72);
+  animation: micWavePulse 1.8s ease-out infinite;
+}
+
+.mic-wave-delay-1 {
+  animation-delay: 0.6s;
+}
+
+.mic-wave-delay-2 {
+  animation-delay: 1.2s;
+}
+
+@keyframes micWavePulse {
+  0% {
+    opacity: 0;
+    transform: scale(0.72);
+  }
+
+  22% {
+    opacity: 0.72;
+  }
+
+  100% {
+    opacity: 0;
+    transform: scale(1.45);
+  }
+}
+
+@keyframes micIconBob {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+
+  50% {
+    transform: scale(1.08);
+  }
+}

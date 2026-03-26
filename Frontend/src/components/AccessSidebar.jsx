@@ -7,6 +7,7 @@ function AccessSidebar({
   conversations,
   activeConversationId,
   onConversationSelect,
+  onDeleteConversation,
   onNewChat,
   uploadVisibilityScope,
   onUploadVisibilityChange,
@@ -36,19 +37,35 @@ function AccessSidebar({
 
       <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
         {conversations.map((conversation) => (
-          <button
+          <div
             key={conversation.id}
-            type="button"
-            onClick={() => onConversationSelect(conversation.id)}
             className={`block w-full rounded-2xl border px-3 py-3 text-left transition ${
               conversation.id === activeConversationId
                 ? 'border-white/20 bg-[#2a2a2a]'
                 : 'border-white/10 bg-[#212121] hover:bg-[#2a2a2a]'
             }`}
           >
-            <p className="truncate text-sm text-white">{conversation.title}</p>
-            <p className="mt-1 text-xs text-zinc-500">{formatConversationTime(conversation.updatedAt)}</p>
-          </button>
+            <div className="flex items-start gap-3">
+              <button
+                type="button"
+                onClick={() => onConversationSelect(conversation.id)}
+                className="min-w-0 flex-1 text-left"
+              >
+                <p className="truncate text-sm text-white">{conversation.title}</p>
+                <p className="mt-1 text-xs text-zinc-500">{formatConversationTime(conversation.updatedAt)}</p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => onDeleteConversation(conversation.id)}
+                className="rounded-full border border-white/10 bg-[#171717] px-2 py-1 text-[11px] text-zinc-400 transition hover:bg-[#303030] hover:text-white"
+                aria-label={`Delete chat ${conversation.title}`}
+                title="Delete chat"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
         ))}
       </div>
 

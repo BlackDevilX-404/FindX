@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import time
 import uuid
 import csv
 from dataclasses import dataclass, replace
@@ -10,12 +11,21 @@ from typing import Any, Optional
 import chromadb
 import fitz
 from dotenv import load_dotenv
+from huggingface_hub.utils import disable_progress_bars
+from huggingface_hub.utils import logging as hf_logging
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
+from transformers.utils import logging as transformers_logging
 from docx import Document as DocxDocument
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+hf_logging.set_verbosity_error()
+transformers_logging.set_verbosity_error()
+disable_progress_bars()
+transformers_logging.disable_progress_bar()
 
 try:
     from .auth import ROLE_ADMIN, ROLE_DEVELOPER, ROLE_HR
@@ -112,6 +122,8 @@ SMALL_TALK_PATTERNS = [
     re.compile(r"^(who are you|what can you do)\??$", re.IGNORECASE),
 ]
 FILE_REFERENCE_PATTERN = re.compile(r"\b[\w.-]+\.(pdf|ppt|pptx|docx|txt|md|csv|json|xlsx)\b", re.IGNORECASE)
+FILE_TYPE_HINT_PATTERN = re.compile(r"\b(pdf|ppt|pptx|docx|txt|md|csv|json|xlsx)\b", re.IGNORECASE)
+PAGE_REFERENCE_PATTERN = re.compile(r"\bpage\s*(?:#|no\.?|number)?\s*(\d{1,4})\b", re.IGNORECASE)
 DEFAULT_AGENT_TOP_K = 4
 MIN_AGENT_TOP_K = 2
 MAX_AGENT_TOP_K = 8
@@ -120,6 +132,9 @@ TARGET_CHUNK_TOKENS = 280
 CHUNK_OVERLAP_TOKENS = 60
 SHORT_PARAGRAPH_WORDS = 45
 MAX_EXPANDED_CONTEXT_TOKENS = 360
+EMBEDDING_BATCH_SIZE = 32
+INGEST_WRITE_BATCH_SIZE = 96
+INGEST_PROGRESS_PAGE_INTERVAL = 10
 
 
 class SourceItem(BaseModel):
@@ -418,6 +433,7 @@ def build_access_where_filter(
     allowed_visibility_scopes: list[str],
     document_id: str | None = None,
     document_ids: list[str] | None = None,
+    page: int | None = None,
 ) -> dict[str, Any]:
     category_filter = build_category_where_filter(allowed_categories)
     visibility_filter = {"visibility_scope": {"$in": sorted({scope.lower() for scope in allowed_visibility_scopes})}}
@@ -426,6 +442,8 @@ def build_access_where_filter(
         filters.append({"document_id": {"$in": sorted(set(document_ids))}})
     elif document_id:
         filters.append({"document_id": {"$eq": document_id}})
+    if page is not None:
+        filters.append({"page": {"$eq": page}})
     return {"$and": filters}
 
 
@@ -436,6 +454,18 @@ def format_confidence(score: float) -> str:
 
 def build_metadata_payload(metadata: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in metadata.items() if value is not None}
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+
+    minutes, remaining_seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {remaining_seconds:04.1f}s"
+
+    hours, remaining_minutes = divmod(int(minutes), 60)
+    return f"{hours}h {remaining_minutes:02d}m {remaining_seconds:04.1f}s"
 
 
 class EnterpriseRAGService:
@@ -468,13 +498,65 @@ class EnterpriseRAGService:
             cls._embedder = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
         return cls._embedder
 
+    def _get_chroma_batch_size(self) -> int:
+        try:
+            batch_size = int(self.client.get_max_batch_size())
+        except Exception:
+            batch_size = INGEST_WRITE_BATCH_SIZE
+
+        return max(batch_size, 1)
+
+    def _iter_batches(self, items: list[Any], batch_size: int):
+        safe_batch_size = max(batch_size, 1)
+        for index in range(0, len(items), safe_batch_size):
+            yield items[index : index + safe_batch_size]
+
+    @staticmethod
+    def _should_log_progress(current: int, total: int, interval: int) -> bool:
+        if total <= 0:
+            return True
+        if current in {1, total}:
+            return True
+        return current % max(interval, 1) == 0
+
+    @staticmethod
+    def _build_progress_bar(current: int, total: int, width: int = 20) -> str:
+        if total <= 0:
+            return "[" + ("-" * width) + "]"
+
+        ratio = max(0.0, min(current / total, 1.0))
+        filled = min(width, max(0, round(ratio * width)))
+        return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
+
+    def _log_ingest(self, document_name: str, stage: str, message: str) -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        print(f"[{timestamp}] [Ingest] [{document_name}] [{stage}] {message}", flush=True)
+
+    def _log_ingest_progress(
+        self,
+        document_name: str,
+        stage: str,
+        current: int,
+        total: int,
+        unit_label: str,
+        detail: str = "",
+    ) -> None:
+        progress_bar = self._build_progress_bar(current, total)
+        percentage = 0 if total <= 0 else round((current / total) * 100)
+        suffix = f" | {detail}" if detail else ""
+        self._log_ingest(
+            document_name,
+            stage,
+            f"{progress_bar} {percentage:>3}% ({current}/{total} {unit_label}){suffix}",
+        )
+
     def save_upload(self, filename: str, file_bytes: bytes) -> Path:
         extension = Path(filename).suffix.lower()
         stored_path = self.downloads_dir / f"{uuid.uuid4().hex}{extension}"
         stored_path.write_bytes(file_bytes)
         return stored_path
 
-    def _convert_to_pdf_if_needed(self, file_path: Path) -> Path:
+    def _convert_to_pdf_if_needed(self, file_path: Path, document_name: str | None = None) -> Path:
         extension = file_path.suffix.lower()
         if extension == ".pdf":
             return file_path
@@ -485,6 +567,8 @@ class EnterpriseRAGService:
             )
 
         relative_base = Path("downloads") / file_path.stem
+        if document_name:
+            self._log_ingest(document_name, "CONVERT", "Converting presentation to PDF before ingestion.")
         converter = Ppt2Pdf(str(relative_base).replace("\\", "/"), extension[1:])
         converter.convert_ppt_to_pdf()
         pdf_path = self.base_dir / f"{relative_base}.pdf"
@@ -562,13 +646,18 @@ class EnterpriseRAGService:
 
         return [{"page": 1, "text": normalized}]
 
-    def _extract_pages_from_file(self, file_path: Path) -> list[dict[str, Any]]:
+    def _extract_pages_from_file(
+        self,
+        file_path: Path,
+        document_name: str | None = None,
+    ) -> list[dict[str, Any]]:
         extension = file_path.suffix.lower()
 
         if extension == ".pdf":
-            return self._extract_pages(file_path)
+            return self._extract_pages(file_path, document_name=document_name)
         if extension in {".ppt", ".pptx"}:
-            return self._extract_pages(self._convert_to_pdf_if_needed(file_path))
+            converted_pdf_path = self._convert_to_pdf_if_needed(file_path, document_name=document_name)
+            return self._extract_pages(converted_pdf_path, document_name=document_name)
         if extension == ".docx":
             return self._extract_docx_pages(file_path)
         if extension == ".xlsx":
@@ -580,9 +669,13 @@ class EnterpriseRAGService:
             "Unsupported file type. Supported formats: PDF, PPT, PPTX, DOCX, TXT, MD, CSV, JSON, XLSX."
         )
 
-    def _extract_pages(self, pdf_path: Path) -> list[dict[str, Any]]:
+    def _extract_pages(self, pdf_path: Path, document_name: str | None = None) -> list[dict[str, Any]]:
         document = fitz.open(pdf_path)
         pages: list[dict[str, Any]] = []
+        total_pages = len(document)
+
+        if document_name:
+            self._log_ingest(document_name, "EXTRACT", f"Reading {total_pages} PDF page(s).")
 
         try:
             for page_number, page in enumerate(document, start=1):
@@ -598,35 +691,127 @@ class EnterpriseRAGService:
                 page_text = "\n\n".join(blocks).strip()
                 if page_text:
                     pages.append({"page": page_number, "text": page_text})
+
+                if document_name and self._should_log_progress(
+                    page_number,
+                    total_pages,
+                    INGEST_PROGRESS_PAGE_INTERVAL,
+                ):
+                    self._log_ingest_progress(
+                        document_name,
+                        "EXTRACT",
+                        page_number,
+                        total_pages,
+                        "pages",
+                        detail=f"{len(pages)} page(s) with extractable text",
+                    )
         finally:
             document.close()
 
         return pages
 
-    def _chunk_pages(self, pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _chunk_page(self, page: dict[str, Any]) -> list[dict[str, Any]]:
         chunks: list[dict[str, Any]] = []
+        paragraphs = merge_short_paragraphs(split_paragraphs(page["text"]))
+        for paragraph_index, paragraph in enumerate(paragraphs):
+            tokens = normalize_text(" ".join(sentence_chunks(paragraph))).split()
+            if not tokens:
+                continue
 
-        for page in pages:
-            paragraphs = merge_short_paragraphs(split_paragraphs(page["text"]))
-            for paragraph_index, paragraph in enumerate(paragraphs):
-                tokens = normalize_text(" ".join(sentence_chunks(paragraph))).split()
-                if not tokens:
-                    continue
+            token_windows = [tokens] if len(tokens) <= TARGET_CHUNK_TOKENS else sliding_chunks(tokens)
+            for window_index, token_window in enumerate(token_windows):
+                chunk_text = normalize_text(" ".join(token_window))
+                if len(chunk_text) >= 30:
+                    chunks.append(
+                        {
+                            "page": page["page"],
+                            "paragraph": paragraph_index,
+                            "window": window_index,
+                            "text": chunk_text,
+                        }
+                    )
+        return chunks
 
-                token_windows = [tokens] if len(tokens) <= TARGET_CHUNK_TOKENS else sliding_chunks(tokens)
-                for window_index, token_window in enumerate(token_windows):
-                    chunk_text = normalize_text(" ".join(token_window))
-                    if len(chunk_text) >= 30:
-                        chunks.append(
-                            {
-                                "page": page["page"],
-                                "paragraph": paragraph_index,
-                                "window": window_index,
-                                "text": chunk_text,
-                            }
-                        )
+    def _chunk_pages(
+        self,
+        pages: list[dict[str, Any]],
+        document_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        chunks: list[dict[str, Any]] = []
+        total_pages = len(pages)
+
+        if document_name:
+            self._log_ingest(document_name, "CHUNK", f"Building chunks from {total_pages} extracted page(s).")
+
+        for page_index, page in enumerate(pages, start=1):
+            page_chunks = self._chunk_page(page)
+            chunks.extend(page_chunks)
+
+            if document_name and self._should_log_progress(
+                page_index,
+                total_pages,
+                INGEST_PROGRESS_PAGE_INTERVAL,
+            ):
+                self._log_ingest_progress(
+                    document_name,
+                    "CHUNK",
+                    page_index,
+                    total_pages,
+                    "pages",
+                    detail=f"{len(chunks)} chunk(s) prepared",
+                )
 
         return chunks
+
+    def _store_chunk_batch(
+        self,
+        *,
+        document_id: str,
+        document_name: str,
+        category: str,
+        sensitivity: str | None,
+        visibility_scope: str,
+        uploaded_by: str,
+        chunk_batch: list[dict[str, Any]],
+    ) -> int:
+        texts = [chunk["text"] for chunk in chunk_batch]
+        embeddings = self.embedder.encode(
+            texts,
+            batch_size=min(EMBEDDING_BATCH_SIZE, max(len(texts), 1)),
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        ).tolist()
+
+        ids = [
+            f"{document_id}:{chunk['page']}:{chunk['paragraph']}:{chunk['window']}"
+            for chunk in chunk_batch
+        ]
+        metadatas = [
+            build_metadata_payload(
+                {
+                    "chunk_id": f"{document_id}:{chunk['page']}:{chunk['paragraph']}:{chunk['window']}",
+                    "document_id": document_id,
+                    "document": document_name,
+                    "category": category,
+                    "sensitivity": sensitivity,
+                    "visibility_scope": visibility_scope,
+                    "page": chunk["page"],
+                    "paragraph": chunk["paragraph"],
+                    "window": chunk["window"],
+                    "char_count": len(chunk["text"]),
+                    "uploaded_by": uploaded_by,
+                }
+            )
+            for chunk in chunk_batch
+        ]
+
+        self.collection.add(
+            ids=ids,
+            documents=texts,
+            embeddings=embeddings,
+            metadatas=metadatas,
+        )
+        return len(chunk_batch)
 
     def ingest_document(
         self,
@@ -639,46 +824,65 @@ class EnterpriseRAGService:
     ) -> IngestResult:
         validated_category = validate_category(category)
         validated_visibility_scope = validate_visibility_scope(visibility_scope)
-        pages = self._extract_pages_from_file(file_path)
-        chunks = self._chunk_pages(pages)
+        started_at = time.perf_counter()
+        self._log_ingest(document_name, "START", f"Preparing ingestion for {file_path.name}.")
+        pages = self._extract_pages_from_file(file_path, document_name=document_name)
+        chunks = self._chunk_pages(pages, document_name=document_name)
 
         if not chunks:
             raise ValueError("No extractable text found in the uploaded document.")
 
         document_id = uuid.uuid4().hex
-        texts = [chunk["text"] for chunk in chunks]
-        embeddings = self.embedder.encode(
-            texts,
-            batch_size=32,
-            show_progress_bar=False,
-            normalize_embeddings=True,
-        ).tolist()
+        total_chunks = len(chunks)
+        total_batches = max(1, (total_chunks + INGEST_WRITE_BATCH_SIZE - 1) // INGEST_WRITE_BATCH_SIZE)
+        indexed_chunks = 0
+        self._log_ingest(
+            document_name,
+            "INDEX",
+            f"Encoding and storing {total_chunks} chunk(s) in {total_batches} batch(es).",
+        )
 
-        self.collection.add(
-            ids=[
-                f"{document_id}:{chunk['page']}:{chunk['paragraph']}:{chunk['window']}"
-                for chunk in chunks
-            ],
-            documents=texts,
-            embeddings=embeddings,
-            metadatas=[
-                build_metadata_payload(
-                    {
-                        "chunk_id": f"{document_id}:{chunk['page']}:{chunk['paragraph']}:{chunk['window']}",
-                        "document_id": document_id,
-                        "document": document_name,
-                        "category": validated_category,
-                        "sensitivity": sensitivity,
-                        "visibility_scope": validated_visibility_scope,
-                        "page": chunk["page"],
-                        "paragraph": chunk["paragraph"],
-                        "window": chunk["window"],
-                        "char_count": len(chunk["text"]),
-                        "uploaded_by": uploaded_by,
-                    }
+        try:
+            for batch_index, offset in enumerate(range(0, total_chunks, INGEST_WRITE_BATCH_SIZE), start=1):
+                batch_started_at = time.perf_counter()
+                chunk_batch = chunks[offset : offset + INGEST_WRITE_BATCH_SIZE]
+                indexed_chunks += self._store_chunk_batch(
+                    document_id=document_id,
+                    document_name=document_name,
+                    category=validated_category,
+                    sensitivity=sensitivity,
+                    visibility_scope=validated_visibility_scope,
+                    uploaded_by=uploaded_by,
+                    chunk_batch=chunk_batch,
                 )
-                for chunk in chunks
-            ],
+                self._log_ingest_progress(
+                    document_name,
+                    "INDEX",
+                    indexed_chunks,
+                    total_chunks,
+                    "chunks",
+                    detail=(
+                        f"batch {batch_index}/{total_batches} finished in "
+                        f"{format_duration(time.perf_counter() - batch_started_at)}"
+                    ),
+                )
+        except Exception:
+            self._log_ingest(
+                document_name,
+                "ROLLBACK",
+                "Indexing failed. Removing any partially stored chunks for this document.",
+            )
+            self.collection.delete(where={"document_id": {"$eq": document_id}})
+            self._document_chunk_cache.pop(document_id, None)
+            raise
+
+        self._log_ingest(
+            document_name,
+            "DONE",
+            (
+                f"Finished ingestion: {len(pages)} page(s), {total_chunks} chunk(s), "
+                f"{format_duration(time.perf_counter() - started_at)} total."
+            ),
         )
 
         return IngestResult(
@@ -818,6 +1022,115 @@ class EnterpriseRAGService:
         )
         self._document_chunk_cache[document_id] = records
         return records
+
+    @staticmethod
+    def _extract_requested_page(query_text: str) -> int | None:
+        match = PAGE_REFERENCE_PATTERN.search(query_text or "")
+        if not match:
+            return None
+
+        try:
+            page_number = int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+        return page_number if page_number > 0 else None
+
+    @staticmethod
+    def _combine_page_records(records: list[dict[str, Any]]) -> str:
+        ordered_records = sorted(
+            records,
+            key=lambda item: (
+                item.get("paragraph") or 0,
+                item.get("window") or 0,
+            ),
+        )
+
+        page_texts: list[str] = []
+        for record in ordered_records:
+            text = normalize_text(record.get("text") or "")
+            if not text or text in page_texts:
+                continue
+            page_texts.append(text)
+
+        return normalize_text(" ".join(page_texts))
+
+    @staticmethod
+    def _get_document_label(document_id: str) -> str:
+        for record in list_document_records():
+            if str(record.get("document_id") or "").strip() != document_id:
+                continue
+            document_name = str(record.get("document") or "").strip()
+            if document_name:
+                return document_name
+        return document_id
+
+    def _fetch_exact_page_chunks(
+        self,
+        query_text: str,
+        role: str,
+        document_id: str,
+        page_number: int,
+    ) -> list[RetrievedChunk]:
+        results = self.collection.get(
+            where=build_access_where_filter(
+                allowed_categories_for_role(role),
+                allowed_visibility_scopes_for_role(role),
+                document_id=document_id,
+                page=page_number,
+            ),
+            include=["documents", "metadatas"],
+        )
+
+        page_records: list[dict[str, Any]] = []
+        document_name = self._get_document_label(document_id)
+        category = "GENERAL"
+        sensitivity = None
+
+        for document_text, metadata in zip(results.get("documents") or [], results.get("metadatas") or []):
+            if not document_text or not metadata:
+                continue
+
+            text = normalize_text(document_text)
+            if not text:
+                continue
+
+            document_name = str(metadata.get("document") or document_name or document_id).strip() or document_id
+            category = normalize_category_value(metadata.get("category") or category)
+            sensitivity = metadata.get("sensitivity")
+            page_records.append(
+                {
+                    "text": text,
+                    "paragraph": coerce_optional_int(metadata.get("paragraph")),
+                    "window": coerce_optional_int(metadata.get("window")),
+                }
+            )
+
+        combined_text = self._combine_page_records(page_records)
+        if not combined_text:
+            return []
+
+        overlap_score = keyword_overlap(query_text, combined_text)
+        density_score = keyword_density(query_text, combined_text)
+        exact_page_score = max(0.99, round((overlap_score * 0.5) + (density_score * 0.5), 4))
+
+        return [
+            RetrievedChunk(
+                id=f"{document_id}:{page_number}:page",
+                document_id=document_id,
+                document=document_name,
+                category=category,
+                sensitivity=sensitivity,
+                page=page_number,
+                paragraph=0,
+                window=0,
+                text=combined_text,
+                score=exact_page_score,
+                semantic_score=exact_page_score,
+                lexical_score=max(overlap_score, 0.5),
+                retrieval_query=query_text,
+            )
+        ]
 
     def _expand_chunk_context(self, question: str, chunk: RetrievedChunk) -> RetrievedChunk:
         if not chunk.document_id or chunk.page is None:
@@ -986,7 +1299,53 @@ class EnterpriseRAGService:
 
         matches = exact_matches or stem_matches
         if not matches:
-            return None
+            if not FILE_TYPE_HINT_PATTERN.search(normalized_query):
+                return None
+
+            query_terms = {
+                token
+                for token in extract_keywords(normalized_query)
+                if len(token) >= 3 and not token.isdigit()
+            }
+            if not query_terms:
+                return None
+
+            scored_matches: list[tuple[tuple[int, int, str, str], dict[str, Any]]] = []
+            for record in active_records:
+                document_name = str(record.get("document") or "").strip()
+                if not document_name:
+                    continue
+
+                document_terms = {
+                    token
+                    for token in WORD_PATTERN.findall(Path(document_name).stem.lower())
+                    if len(token) >= 3 and token not in STOP_WORDS and not token.isdigit()
+                }
+                overlap = query_terms & document_terms
+                if not overlap:
+                    continue
+
+                ranked_overlap = max(len(token) for token in overlap)
+                scored_matches.append(
+                    (
+                        (
+                            len(overlap),
+                            ranked_overlap,
+                            *self._document_record_sort_key(record),
+                        ),
+                        record,
+                    )
+                )
+
+            if not scored_matches:
+                return None
+
+            scored_matches.sort(key=lambda item: item[0], reverse=True)
+            best_score = scored_matches[0][0]
+            tied_best = [record for score, record in scored_matches if score == best_score]
+            if len(tied_best) != 1:
+                return None
+            matches = tied_best
 
         matches.sort(key=self._document_record_sort_key, reverse=True)
         resolved_id = str(matches[0].get("document_id") or "").strip()
@@ -1375,7 +1734,12 @@ class EnterpriseRAGService:
             )
             for metadata in metadatas
         ]
-        self.collection.update(ids=ids, metadatas=next_metadatas)
+        max_batch_size = self._get_chroma_batch_size()
+        for id_batch, metadata_batch in zip(
+            self._iter_batches(ids, max_batch_size),
+            self._iter_batches(next_metadatas, max_batch_size),
+        ):
+            self.collection.update(ids=id_batch, metadatas=metadata_batch)
         return True
 
     def delete_document(self, document_id: str) -> bool:
@@ -1385,7 +1749,9 @@ class EnterpriseRAGService:
         )
         ids = results.get("ids") or []
         if ids:
-            self.collection.delete(ids=ids)
+            max_batch_size = self._get_chroma_batch_size()
+            for id_batch in self._iter_batches(ids, max_batch_size):
+                self.collection.delete(ids=id_batch)
 
         self._document_chunk_cache.pop(document_id, None)
         return bool(ids)
@@ -1614,27 +1980,42 @@ class EnterpriseRAGService:
             )
         return "\n\n".join(lines)
 
-    def _generate_answer(self, query_text: str, chunks: list[RetrievedChunk]) -> str:
+    def _build_answer_messages(self, query_text: str, chunks: list[RetrievedChunk]) -> list[Any]:
         context = self._build_context(chunks)
-        response = self.llm.invoke(
-            [
-                SystemMessage(
-                    content=(
-                        "You are an enterprise RAG assistant. "
-                        "Answer strictly from the retrieved context. "
-                        "If the context is insufficient, say so clearly. "
-                        "Do not invent policy details."
-                    )
-                ),
-                HumanMessage(
-                    content=(
-                        f"User question:\n{query_text}\n\n"
-                        f"Authorized retrieved context:\n{context}\n\n"
-                        "Write a concise answer grounded only in that context."
-                    )
-                ),
-            ]
-        )
+        return [
+            SystemMessage(
+                content=(
+                    "You are an enterprise RAG assistant. "
+                    "Answer strictly from the retrieved context. "
+                    "If the context is insufficient, say so clearly. "
+                    "Do not invent policy details."
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f"User question:\n{query_text}\n\n"
+                    f"Authorized retrieved context:\n{context}\n\n"
+                    "Write a concise answer grounded only in that context."
+                )
+            ),
+        ]
+
+    @staticmethod
+    def _read_stream_text(content: Any) -> str:
+        if isinstance(content, str):
+            return _normalize_unicode(content)
+
+        if isinstance(content, list):
+            return "".join(
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+
+        return ""
+
+    def _generate_answer(self, query_text: str, chunks: list[RetrievedChunk]) -> str:
+        response = self.llm.invoke(self._build_answer_messages(query_text, chunks))
 
         if isinstance(response.content, str):
             return normalize_text(response.content)
@@ -1648,6 +2029,12 @@ class EnterpriseRAGService:
             return normalize_text(text)
 
         return "No accessible data found for your role"
+
+    def _stream_answer(self, query_text: str, chunks: list[RetrievedChunk]):
+        for chunk in self.llm.stream(self._build_answer_messages(query_text, chunks)):
+            delta = self._read_stream_text(getattr(chunk, "content", ""))
+            if delta:
+                yield delta
 
     def _answer_small_talk(self, query_text: str) -> QueryResult:
         response = self.llm.invoke(
@@ -1687,27 +2074,32 @@ class EnterpriseRAGService:
             f"{document_summary}. Top supporting match scored about {format_confidence(lead_chunk.score)}."
         )
 
-    def query(
-        self,
-        query_text: str,
-        role: str,
-        chat_id: str | None = None,
-        doc_uuid: str | None = None,
-        chat_history: list[dict[str, Any]] | None = None,
-        top_k: int = 4,
-    ) -> QueryResult:
+    def _build_sources(self, chunks: list[RetrievedChunk]) -> list[SourceItem]:
+        return [
+            SourceItem(
+                id=chunk.id,
+                document=chunk.document,
+                doc_uuid=chunk.document_id,
+                snippet=chunk.text[:480],
+                page=chunk.page,
+                confidence=format_confidence(chunk.score),
+            )
+            for chunk in chunks
+        ]
+
+    def _resolve_query(self, query_text: str, role: str, chat_id: str | None, doc_uuid: str | None, chat_history: list[dict[str, Any]] | None, top_k: int) -> tuple[list[RetrievedChunk], QueryResult | None]:
         normalized_role = normalize_role(role)
         allowed_categories = allowed_categories_for_role(normalized_role)
         allowed_visibility_scopes = allowed_visibility_scopes_for_role(normalized_role)
         if not allowed_categories or not allowed_visibility_scopes:
-            return QueryResult(
+            return [], QueryResult(
                 answer="No accessible data found for your role",
                 explanation="Your role does not have access to any searchable document categories.",
                 sources=[],
             )
 
         if self._is_small_talk(query_text):
-            return self._answer_small_talk(query_text)
+            return [], self._answer_small_talk(query_text)
 
         normalized_history = self._normalize_chat_history(chat_history)
         resolved_doc_uuid = self._resolve_fixed_document_id(
@@ -1718,11 +2110,35 @@ class EnterpriseRAGService:
         if (doc_uuid and not resolved_doc_uuid) or (
             not doc_uuid and self._query_mentions_specific_document(query_text) and not resolved_doc_uuid
         ):
-            return QueryResult(
+            return [], QueryResult(
                 answer="No accessible data found for your role",
                 explanation="The request explicitly referenced a document that is deleted, unavailable, or outside your access scope.",
                 sources=[],
             )
+
+        requested_page = self._extract_requested_page(query_text)
+        if requested_page is not None and resolved_doc_uuid:
+            exact_page_chunks = self._fetch_exact_page_chunks(
+                query_text=query_text,
+                role=normalized_role,
+                document_id=resolved_doc_uuid,
+                page_number=requested_page,
+            )
+            if exact_page_chunks:
+                return exact_page_chunks, None
+
+            document_label = self._get_document_label(resolved_doc_uuid)
+            return [], QueryResult(
+                answer=(
+                    f"No extractable content was found on page {requested_page} of {document_label}."
+                ),
+                explanation=(
+                    "The request targeted an exact page in a specific accessible document, "
+                    "but that page is not indexed or has no extractable text."
+                ),
+                sources=[],
+            )
+
         selected_chunks = self._run_agentic_enterprise_retrieval(
             query_text=query_text,
             role=normalized_role,
@@ -1750,26 +2166,88 @@ class EnterpriseRAGService:
             )
 
         if not selected_chunks or not self._is_confident_enough(query_text, selected_chunks):
-            return QueryResult(
+            return [], QueryResult(
                 answer="No accessible data found for your role",
                 explanation="The agent searched accessible documents, including rewritten retrieval attempts, but did not find a strong enough grounded match for this question.",
                 sources=[],
             )
 
+        return selected_chunks, None
+
+    def query(
+        self,
+        query_text: str,
+        role: str,
+        chat_id: str | None = None,
+        doc_uuid: str | None = None,
+        chat_history: list[dict[str, Any]] | None = None,
+        top_k: int = 4,
+    ) -> QueryResult:
+        selected_chunks, early_result = self._resolve_query(
+            query_text=query_text,
+            role=role,
+            chat_id=chat_id,
+            doc_uuid=doc_uuid,
+            chat_history=chat_history,
+            top_k=top_k,
+        )
+        if early_result is not None:
+            return early_result
+
         answer = self._generate_answer(query_text, selected_chunks)
-        sources = [
-            SourceItem(
-                id=chunk.id,
-                document=chunk.document,
-                doc_uuid=chunk.document_id,
-                snippet=chunk.text[:480],
-                page=chunk.page,
-                confidence=format_confidence(chunk.score),
-            )
-            for chunk in selected_chunks
-        ]
+        sources = self._build_sources(selected_chunks)
         return QueryResult(
             answer=answer,
             explanation=self._build_explanation(selected_chunks),
             sources=sources,
         )
+
+    def stream_query(
+        self,
+        query_text: str,
+        role: str,
+        chat_id: str | None = None,
+        doc_uuid: str | None = None,
+        chat_history: list[dict[str, Any]] | None = None,
+        top_k: int = 4,
+    ):
+        selected_chunks, early_result = self._resolve_query(
+            query_text=query_text,
+            role=role,
+            chat_id=chat_id,
+            doc_uuid=doc_uuid,
+            chat_history=chat_history,
+            top_k=top_k,
+        )
+
+        if early_result is not None:
+            yield {
+                "type": "final",
+                "answer": early_result.answer,
+                "explanation": early_result.explanation,
+                "sources": [source.model_dump() for source in early_result.sources],
+            }
+            return
+
+        streamed_parts: list[str] = []
+        try:
+            for delta in self._stream_answer(query_text, selected_chunks):
+                streamed_parts.append(delta)
+                yield {"type": "token", "delta": delta}
+        except Exception:
+            if not streamed_parts:
+                fallback_answer = self._generate_answer(query_text, selected_chunks)
+                streamed_parts.append(fallback_answer)
+                yield {"type": "token", "delta": fallback_answer}
+
+        answer = normalize_text("".join(streamed_parts))
+        if not answer:
+            answer = self._generate_answer(query_text, selected_chunks)
+
+        sources = self._build_sources(selected_chunks)
+        yield {
+            "type": "final",
+            "answer": answer,
+            "explanation": self._build_explanation(selected_chunks),
+            "sources": [source.model_dump() for source in sources],
+        }

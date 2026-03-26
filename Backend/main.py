@@ -1,7 +1,10 @@
+import json
+import time
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 try:
@@ -89,6 +92,26 @@ class VisibilityUpdateRequest(BaseModel):
     visibility_scope: str = Field(...)
 
 
+def _format_file_size(byte_count: int) -> str:
+    size = float(max(byte_count, 0))
+    units = ["B", "KB", "MB", "GB"]
+    unit_index = 0
+
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+
+    return f"{size:.1f} {units[unit_index]}"
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+
+    minutes, remaining_seconds = divmod(seconds, 60)
+    return f"{int(minutes)}m {remaining_seconds:04.1f}s"
+
+
 def _resolve_query_scope(request: QueryRequest, current_user: dict[str, Any]) -> str | None:
     requested_chat_id = (request.chat_id or "").strip()
     current_role = current_user["role"]
@@ -147,23 +170,42 @@ async def upload_document(
     session_id: str | None = Form(None),
     current_user: dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
 ):
+    filename = file.filename or "uploaded-file"
     file_bytes = await file.read()
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
+    upload_started_at = time.perf_counter()
+    print(
+        (
+            f"[Upload] [{filename}] Received from {current_user['username']} | "
+            f"size={_format_file_size(len(file_bytes))} | "
+            f"category={category} | visibility={visibility_scope}"
+        ),
+        flush=True,
+    )
+
     try:
-        stored_path = rag_service.save_upload(file.filename, file_bytes)
+        stored_path = rag_service.save_upload(filename, file_bytes)
         result = rag_service.ingest_document(
             file_path=stored_path,
-            document_name=file.filename,
+            document_name=filename,
             category=category,
             sensitivity=sensitivity,
             visibility_scope=visibility_scope,
             uploaded_by=current_user["username"],
         )
     except ValueError as exc:
+        print(
+            f"[Upload] [{filename}] Rejected after {_format_duration(time.perf_counter() - upload_started_at)} | {exc}",
+            flush=True,
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
+        print(
+            f"[Upload] [{filename}] Failed after {_format_duration(time.perf_counter() - upload_started_at)} | {exc}",
+            flush=True,
+        )
         raise HTTPException(status_code=500, detail=f"Upload failed: {exc}") from exc
 
     store_document_record(
@@ -174,6 +216,13 @@ async def upload_document(
         visibility_scope=validate_visibility_scope(visibility_scope),
         uploaded_by=current_user["username"],
         chunks_indexed=result.chunks_indexed,
+    )
+    print(
+        (
+            f"[Upload] [{filename}] Completed in {_format_duration(time.perf_counter() - upload_started_at)} | "
+            f"document_id={result.document_id} | chunks_indexed={result.chunks_indexed}"
+        ),
+        flush=True,
     )
     return _build_upload_response(result)
 
@@ -242,6 +291,50 @@ async def query_documents(
         answer=result.answer,
         explanation=result.explanation,
         sources=result.sources,
+    )
+
+
+@app.post("/api/chat/stream")
+async def stream_query_documents(
+    request: QueryRequest,
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    log_query(
+        username=current_user["username"],
+        role=current_user["role"],
+        query=request.query,
+    )
+
+    try:
+        stream = rag_service.stream_query(
+            request.query,
+            role=current_user["role"],
+            chat_id=_resolve_query_scope(request, current_user),
+            doc_uuid=request.doc_uuid,
+            chat_history=request.chat_history,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Query failed: {exc}") from exc
+
+    def iter_events():
+        try:
+            for event in stream:
+                yield json.dumps(event) + "\n"
+        except Exception as exc:
+            yield json.dumps(
+                {
+                    "type": "error",
+                    "detail": f"Query failed: {exc}",
+                }
+            ) + "\n"
+
+    return StreamingResponse(
+        iter_events(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

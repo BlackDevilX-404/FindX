@@ -1,3 +1,4 @@
+import os
 import json
 import re
 import uuid
@@ -7,7 +8,16 @@ from pathlib import Path
 from typing import Any, Optional
 
 import chromadb
+from huggingface_hub.utils import disable_progress_bars
+from huggingface_hub.utils import logging as hf_logging
 from sentence_transformers import SentenceTransformer
+from transformers.utils import logging as transformers_logging
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+hf_logging.set_verbosity_error()
+transformers_logging.set_verbosity_error()
+disable_progress_bars()
+transformers_logging.disable_progress_bar()
 
 WORD_PATTERN = re.compile(r"[a-zA-Z0-9]+")
 STOP_WORDS = {

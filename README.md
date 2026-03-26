@@ -11,6 +11,8 @@ The current system focuses on:
 - role-based access control at the API layer
 - role-based search inside retrieval
 - grounded answers with evidence snippets
+- streamed chat responses from the backend
+- synchronous document ingestion with batched indexing and terminal progress logs
 - a minimal ChatGPT-style dark frontend
 
 ## 1. What This Project Does
@@ -67,6 +69,7 @@ The main behavior is:
 - grounded answer generation
 - source snippets returned to the UI
 - query logging in MongoDB
+- exact-page retrieval when a query targets a specific page in a resolved document
 - legacy per-workspace compatibility search
 - simple ChatGPT-inspired dark UI
 - evidence viewer sidebar
@@ -79,10 +82,11 @@ The main behavior is:
 
 ```text
 React UI
-  -> login / upload / chat requests
+  -> login / upload / streamed chat requests
 FastAPI
   -> auth validation
   -> RBAC enforcement
+  -> synchronous batched document ingestion with terminal progress logging
   -> agentic retrieval planning and evidence selection
 MongoDB
   -> users
@@ -91,21 +95,24 @@ MongoDB
 ChromaDB
   -> vector chunks with metadata
 Groq LLM
-  -> query rewriting, routing, and grounded answer generation
+  -> query rewriting, routing, grounded answer generation, and response streaming
 ```
 
-### Request Flow for `/api/chat`
+### Request Flow for `/api/chat` and `/api/chat/stream`
 
 1. Frontend sends `query`, `chat_id`, and `chat_history`.
 2. FastAPI validates the JWT.
 3. Backend resolves the user scope.
 4. Backend maps role to allowed categories.
 5. The backend agent decides whether the request is conversational or document-grounded.
-6. For document-grounded questions, it can rewrite short follow-ups into standalone retrieval queries.
-7. ChromaDB is queried with a category filter, and multiple retrieval attempts are merged and ranked.
-8. If enterprise chunks are unavailable, the backend may use the legacy workspace store as a compatibility fallback.
-9. The LLM receives only the selected authorized context.
-10. Backend returns:
+6. If the request names a document and a page number, the backend first tries to resolve the document and fetch the exact indexed chunks for that page.
+7. Otherwise, for document-grounded questions, it can rewrite short follow-ups into standalone retrieval queries.
+8. ChromaDB is queried with category and visibility filters, and multiple retrieval attempts are merged and ranked.
+9. If enterprise chunks are unavailable, the backend may use the legacy workspace store as a compatibility fallback.
+10. The LLM receives only the selected authorized context.
+11. Backend returns a normal JSON response on `/api/chat`, or NDJSON token/final events on `/api/chat/stream`.
+
+Standard response shape:
 
 ```json
 {
@@ -121,6 +128,18 @@ Groq LLM
   ]
 }
 ```
+
+### Request Flow for `/api/upload/file`
+
+1. Frontend sends a multipart upload with the file and visibility metadata.
+2. FastAPI validates the JWT and enforces `Admin` access.
+3. The backend stores the raw source file in `Backend/downloads/`.
+4. If the file is a PowerPoint, it is converted to PDF first.
+5. The backend extracts text page-by-page.
+6. The extracted text is chunked page-by-page.
+7. Chunks are embedded and written to ChromaDB in batches instead of one large write.
+8. The backend prints upload and ingestion progress in the terminal for `Upload`, `EXTRACT`, `CHUNK`, `INDEX`, and `DONE`.
+9. The API returns only after indexing completes, so the current upload path is still synchronous even though indexing is now tracked and batched.
 
 ## 5. Repository Structure
 
@@ -167,6 +186,8 @@ Responsibilities:
 - exposes auth, upload, query, and health endpoints
 - enforces role checks
 - resolves query scope for authenticated users
+- streams chat responses over NDJSON
+- logs upload lifecycle events in the terminal
 
 Main routes:
 
@@ -178,6 +199,7 @@ Main routes:
 - `POST /api/upload/file`
 - `POST /query`
 - `POST /api/chat`
+- `POST /api/chat/stream`
 - `GET /health`
 
 ### `Backend/server.py`
@@ -238,15 +260,24 @@ Main enterprise agentic RAG service.
 Responsibilities:
 
 - validate document categories
+- validate upload visibility scopes
 - map roles to allowed categories
+- map roles to allowed visibility scopes
 - route conversational requests away from retrieval when appropriate
 - rewrite underspecified follow-up questions into standalone search queries
 - extract, chunk, and embed uploaded PDFs, PowerPoints, Word files, spreadsheets, and text-like files
+- process long uploads in tracked stages with batched Chroma writes
+- print terminal progress for extract, chunk, and index stages
 - store enterprise chunks in ChromaDB
 - query enterprise chunks using category filters
+- query enterprise chunks using visibility filters
+- resolve shorthand document mentions such as `ITC pdf` to a concrete accessible document when possible
+- short-circuit to exact-page retrieval when a query targets a specific page in a resolved document
 - run multiple retrieval attempts and merge ranked evidence
 - gate weak results
+- batch large Chroma metadata updates and deletes to stay under collection limits
 - call Groq with authorized context only
+- stream grounded answer tokens
 - return structured answer, explanation, and sources
 
 ### `Backend/pdf_chroma_ingest.py`
@@ -266,7 +297,7 @@ This module is useful because some older uploaded data exists in collections suc
 
 ### `Backend/pdf_ppt_extract.py`
 
-PDF to JSON extractor using PyMuPDF and Pillow.
+Legacy PDF-to-JSON extractor using PyMuPDF and Pillow.
 
 Responsibilities:
 
@@ -275,6 +306,11 @@ Responsibilities:
 - extract images
 - save JSON to `Backend/jsons/`
 - save images to `Backend/jsons/ExtractedImages/`
+
+Important note:
+
+- this is not the main enterprise upload path used by `POST /api/upload/file`
+- it remains in the repo for older extraction and compatibility utilities
 
 ### `Backend/process_ppt.py`
 
@@ -302,7 +338,7 @@ Responsibilities:
 - restores auth state from local storage
 - handles login/logout
 - stores frontend chat history per user
-- submits chat requests to the backend
+- submits streaming chat requests to the backend
 - opens and closes both sidebars
 - normalizes returned sources
 - controls upload state and document state
@@ -317,7 +353,7 @@ Responsibilities:
 - stores JWT in local storage
 - calls login
 - fetches current user
-- sends chat messages
+- sends standard and streaming chat messages
 - uploads files
 
 ### `Frontend/src/config/api.js`
@@ -434,10 +470,11 @@ RBAC is enforced before request processing.
 
 | Endpoint | Access |
 |---|---|
-| `POST /login` | public |
-| `GET /me` | authenticated |
-| `POST /upload` | admin only |
-| `POST /query` | authenticated |
+| `POST /login` and `POST /api/auth/login` | public |
+| `GET /me` and `GET /api/auth/me` | authenticated |
+| `POST /upload` and `POST /api/upload/file` | admin only |
+| `POST /query` and `POST /api/chat` | authenticated |
+| `POST /api/chat/stream` | authenticated |
 
 ### Enforcement
 
@@ -473,6 +510,7 @@ Each enterprise chunk stores metadata shaped like:
   "document": "Benefits_Handbook.pdf",
   "category": "HR",
   "sensitivity": "confidential",
+  "visibility_scope": "hr",
   "page": 6,
   "uploaded_by": "admin"
 }
@@ -484,13 +522,17 @@ The backend filters ChromaDB with:
 
 ```python
 where = {
-    "category": {"$in": allowed_categories}
+    "$and": [
+        {"category": {"$in": allowed_categories}},
+        {"visibility_scope": {"$in": allowed_visibility_scopes}}
+    ]
 }
 ```
 
 ### Security Guarantee
 
 - unauthorized categories are excluded before ranking
+- unauthorized visibility scopes are excluded before ranking
 - unauthorized chunks are never sent to the LLM
 - if nothing useful is found, the user gets a safe fallback
 
@@ -589,10 +631,11 @@ This prompt explains the current frontend direction:
 ### Chat UX
 
 - user message bubble on the right
-- assistant messages centered in the main feed
+- assistant messages stream into the main feed
 - citation chips below assistant response
 - explanation text below answer
 - evidence opens in the right sidebar
+- page-specific questions can return evidence from the exact requested page when the document is resolved
 
 ### Admin UX
 
@@ -658,6 +701,7 @@ Multipart form fields:
 - `file`
 - `category`
 - `sensitivity`
+- `visibility_scope`
 - `session_id`
 
 Supported file formats:
@@ -684,6 +728,11 @@ Response:
   "chunks_indexed": 24
 }
 ```
+
+Behavior notes:
+
+- the request returns only after indexing completes
+- the backend prints stage progress in the server terminal during extraction, chunking, and indexing
 
 ### `POST /api/chat`
 
@@ -713,6 +762,24 @@ Response:
     }
   ]
 }
+```
+
+Behavior notes:
+
+- if a question targets a specific page in a resolved document, the backend prefers exact-page retrieval over general semantic search
+- shorthand references such as `ITC pdf` may resolve to a matching accessible document without requiring the full filename
+- if the requested page exists in the document record but has no indexed text, the backend returns a direct insufficiency message for that page
+
+### `POST /api/chat/stream`
+
+Authenticated NDJSON streaming endpoint. The frontend currently prefers this route for chat.
+
+Event examples:
+
+```json
+{"type":"token","delta":"Maternity leave "}
+{"type":"token","delta":"is available ..."}
+{"type":"final","answer":"Maternity leave is available ...","explanation":"string","sources":[{"document":"Benefits_Handbook.pdf","snippet":"...","page":6,"confidence":"94%"}]}
 ```
 
 ### `GET /health`
@@ -833,6 +900,10 @@ Used for:
 Used for:
 
 - uploaded source files in `Backend/downloads/`
+- ChromaDB storage in `Backend/chroma_db_storage/`
+
+Legacy or compatibility utilities may also write:
+
 - extracted JSON in `Backend/jsons/`
 - extracted images in `Backend/jsons/ExtractedImages/`
 
@@ -849,11 +920,23 @@ Every query is recorded in MongoDB as:
 }
 ```
 
+Upload and ingestion progress is also printed in the backend terminal. Typical stages are:
+
+- `Upload` for request receipt, completion, rejection, or failure
+- `EXTRACT` for page-level PDF text extraction progress
+- `CHUNK` for page-level chunk preparation progress
+- `INDEX` for batched embedding and Chroma write progress
+- `DONE` for final ingestion summary
+
 ## 18. Important Implementation Notes
 
 - The enterprise RBAC/RBS backend is the main path.
 - Some frontend document management behavior still uses local mock state for convenience.
 - The upload UI does not yet fully expose backend category selection in an enterprise-perfect way.
+- The current upload route is synchronous: the API responds only after ingestion completes.
+- Large uploads are now processed in tracked stages with batched indexing and terminal progress logs.
+- Page-specific document questions now use exact-page lookup when the document can be resolved from the request.
+- Large visibility updates and deletes are batched to stay within Chroma collection limits.
 - Legacy content can still be searched if enterprise chunks are unavailable.
 - If the indexed data itself is unrelated, retrieval will still return "No accessible data found for your role."
 
@@ -862,6 +945,9 @@ Every query is recorded in MongoDB as:
 - frontend document state is not fully backend-driven
 - legacy and enterprise retrieval coexist during migration
 - upload flow needs stronger category wiring from the frontend
+- live ingestion progress is only visible in the backend terminal, not yet in the browser UI
+- very large uploads still hold the request open because ingestion is synchronous
+- exact-page lookup depends on the document being resolvable from the request or explicitly provided as `doc_uuid`
 - there is no full admin user-management panel yet
 - document deletion currently affects frontend state, not a full backend governance lifecycle
 - source confidence is a retrieval heuristic, not a calibrated probability
@@ -873,7 +959,7 @@ Every query is recorded in MongoDB as:
 - add reranking
 - add document ownership and delete APIs in the backend
 - add admin user management endpoints
-- add ingestion status tracking
+- surface ingestion progress in the UI or move large-document indexing to background jobs
 - add audit views for query logs
 - add tests for auth, RBAC, and retrieval filters
 
@@ -906,8 +992,9 @@ The project is already functional as an enterprise agentic RAG prototype with:
 - login
 - role-aware search
 - grounded answers
+- streaming chat responses
 - evidence display
-- admin upload flow
+- admin upload flow with batched indexing progress in the backend terminal
 - query logging
 
 The best next milestone is to finish the migration from partially local frontend document state to a fully backend-driven document lifecycle.
