@@ -159,6 +159,15 @@ def update_document_visibility(document_id: str, visibility_scope: str) -> bool:
     return result.matched_count > 0
 
 
+def delete_document_record(document_id: str) -> bool:
+    result = documents_col.delete_one({"document_id": document_id})
+    return result.deleted_count > 0
+
+
+def list_document_records() -> list[dict[str, Any]]:
+    return list(documents_col.find({}, {"_id": 0}))
+
+
 def log_query(username: str, role: str, query: str) -> None:
     query_logs_col.insert_one(
         {

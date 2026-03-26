@@ -5,6 +5,7 @@ import ChatWindow from './components/ChatWindow'
 import InputBox from './components/InputBox'
 import {
   clearStoredToken,
+  deleteDocument,
   fetchCurrentUser,
   getStoredToken,
   loginUser,
@@ -132,9 +133,14 @@ function formatChatHistory(messages) {
     }))
 }
 
-function normalizeSource(source, index) {
+function normalizeSource(source, index, scopeId = 'response') {
+  const generatedId = [source?.doc_uuid, source?.doc, source?.document, source?.page ?? 'na', index]
+    .filter(Boolean)
+    .join(':')
+  const baseId = (source?.id ?? generatedId) || `source-${index}`
+
   return {
-    id: source?.id ?? `source-${index}`,
+    id: `${scopeId}:${baseId}`,
     doc:
       source?.doc ??
       source?.document ??
@@ -473,12 +479,13 @@ function App() {
         chatId: getBackendSessionId(currentUser),
         chatHistory: formatChatHistory(existingConversation?.messages ?? []),
       })
+      const assistantMessageId = crypto.randomUUID()
       const sources = Array.isArray(response.sources)
-        ? response.sources.map((source, index) => normalizeSource(source, index))
+        ? response.sources.map((source, index) => normalizeSource(source, index, assistantMessageId))
         : []
 
       const assistantMessage = {
-        id: crypto.randomUUID(),
+        id: assistantMessageId,
         type: 'assistant',
         kind: 'response',
         text: response.answer,
@@ -618,17 +625,29 @@ function App() {
     }
   }
 
-  const handleDeleteDocument = (documentId) => {
+  const handleDeleteDocument = async (documentId) => {
     const target = documents.find((document) => document.id === documentId)
 
-    if (!target || !canDeleteDocument(target, currentUser)) {
+    if (!target || !canDeleteDocument(target, currentUser) || !authToken) {
       return
     }
 
-    setDocuments((current) => current.filter((document) => document.id !== documentId))
+    try {
+      if (target.isSynced) {
+        await deleteDocument({
+          token: authToken,
+          documentId,
+        })
+      }
 
-    if (selectedSource?.doc === target.name) {
-      setSelectedSource(null)
+      setDocuments((current) => current.filter((document) => document.id !== documentId))
+
+      if (selectedSource?.doc === target.name) {
+        setSelectedSource(null)
+      }
+      setUploadError('')
+    } catch (error) {
+      setUploadError(error.message || 'Delete failed.')
     }
   }
 

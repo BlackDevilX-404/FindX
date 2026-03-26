@@ -10,7 +10,7 @@ function CitationChip({ source, isActive, onClick }) {
       }`}
     >
       {source.doc}
-      {source.page ? ` • p.${source.page}` : ''}
+      {source.page ? ` | p.${source.page}` : ''}
     </button>
   )
 }

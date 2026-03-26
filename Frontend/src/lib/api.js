@@ -104,3 +104,12 @@ export function updateDocumentVisibility({ token, documentId, visibilityScope })
     }),
   })
 }
+
+export function deleteDocument({ token, documentId }) {
+  return apiRequest(`/api/documents/${documentId}`, {
+    method: 'DELETE',
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  })
+}

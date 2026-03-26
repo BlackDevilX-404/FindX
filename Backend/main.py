@@ -15,7 +15,7 @@ try:
         serialize_user,
         ROLE_ADMIN,
     )
-    from .db import bootstrap_database, log_query, store_document_record
+    from .db import bootstrap_database, delete_document_record, log_query, store_document_record
     from .db import update_document_visibility as update_document_visibility_record
     from .rag import (
         EnterpriseRAGService,
@@ -35,7 +35,7 @@ except ImportError:
         serialize_user,
         ROLE_ADMIN,
     )
-    from db import bootstrap_database, log_query, store_document_record
+    from db import bootstrap_database, delete_document_record, log_query, store_document_record
     from db import update_document_visibility as update_document_visibility_record
     from rag import (
         EnterpriseRAGService,
@@ -195,6 +195,23 @@ async def update_document_visibility(
         "document_id": document_id,
         "visibility_scope": normalized_scope,
         "message": "Document visibility updated successfully",
+    }
+
+
+@app.delete("/api/documents/{document_id}")
+async def delete_document(
+    document_id: str,
+    current_user: dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
+):
+    deleted_from_index = rag_service.delete_document(document_id)
+    deleted_from_db = delete_document_record(document_id)
+
+    if not deleted_from_index and not deleted_from_db:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {
+        "document_id": document_id,
+        "message": "Document deleted successfully",
     }
 
 

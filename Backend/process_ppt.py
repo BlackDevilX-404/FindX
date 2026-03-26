@@ -22,8 +22,3 @@ class Ppt2Pdf:
             print("✅ Successfully converted to PDF")
         except Exception as e:
             print("❌ Error:", e)
-
-
-if __name__ == "__main__":
-    obj = Ppt2Pdf("ExplainX-Universal-Multimodal-Content-Explainer (1)", "pptx")
-    obj.convert_ppt_to_pdf()
