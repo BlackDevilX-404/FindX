@@ -128,6 +128,7 @@ DEFAULT_AGENT_TOP_K = 4
 MIN_AGENT_TOP_K = 2
 MAX_AGENT_TOP_K = 8
 MAX_AGENT_STEPS = 3
+MAX_VERIFICATION_REFINEMENTS = 1
 TARGET_CHUNK_TOKENS = 280
 CHUNK_OVERLAP_TOKENS = 60
 SHORT_PARAGRAPH_WORDS = 45
@@ -190,6 +191,42 @@ class RetrievalAction:
     top_k: int
     document_id: Optional[str]
     reason: str
+
+
+@dataclass
+class GapQuery:
+    text: str
+    reason: str
+    keep_document_scope: bool = True
+
+
+@dataclass
+class VerificationResult:
+    grounded: bool
+    needs_more_retrieval: bool
+    reason: str
+    gap_query: Optional[GapQuery] = None
+
+
+@dataclass
+class AnswerAttempt:
+    answer: str
+    chunks: list[RetrievedChunk]
+    explanation: str
+    sources: list[SourceItem]
+    verification: Optional[VerificationResult] = None
+    refinement_count: int = 0
+
+
+@dataclass
+class ResolvedQueryContext:
+    query_text: str
+    role: str
+    chat_id: str | None
+    normalized_history: list[dict[str, str]]
+    resolved_doc_uuid: str | None
+    requested_page: int | None
+    top_k: int
 
 
 def _normalize_unicode(text: str) -> str:
@@ -531,6 +568,25 @@ class EnterpriseRAGService:
     def _log_ingest(self, document_name: str, stage: str, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
         print(f"[{timestamp}] [Ingest] [{document_name}] [{stage}] {message}", flush=True)
+
+    def _log_verifier(self, query_text: str, stage: str, message: str) -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        query_preview = normalize_text(query_text)[:96] or "empty-query"
+        print(f"[{timestamp}] [Verifier] [{stage}] [{query_preview}] {message}", flush=True)
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+
+        normalized = str(value or "").strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+        return default
 
     def _log_ingest_progress(
         self,
@@ -2087,19 +2143,193 @@ class EnterpriseRAGService:
             for chunk in chunks
         ]
 
-    def _resolve_query(self, query_text: str, role: str, chat_id: str | None, doc_uuid: str | None, chat_history: list[dict[str, Any]] | None, top_k: int) -> tuple[list[RetrievedChunk], QueryResult | None]:
+    @staticmethod
+    def _build_query_result_from_attempt(attempt: AnswerAttempt) -> QueryResult:
+        return QueryResult(
+            answer=attempt.answer,
+            explanation=attempt.explanation,
+            sources=attempt.sources,
+        )
+
+    @staticmethod
+    def _stream_text_chunks(text: str, chunk_size: int = 32):
+        normalized = text or ""
+        for index in range(0, len(normalized), max(chunk_size, 1)):
+            yield normalized[index : index + max(chunk_size, 1)]
+
+    def _build_verifier_insufficiency_result(self, reason: str) -> QueryResult:
+        explanation = normalize_text(reason) or (
+            "Grounding verification could not confirm a safe answer from the accessible evidence."
+        )
+        return QueryResult(
+            answer="I couldn't verify a grounded answer from the accessible evidence for this question.",
+            explanation=explanation,
+            sources=[],
+        )
+
+    def _build_answer_attempt(
+        self,
+        query_text: str,
+        chunks: list[RetrievedChunk],
+        refinement_count: int = 0,
+    ) -> AnswerAttempt:
+        return AnswerAttempt(
+            answer=self._generate_answer(query_text, chunks),
+            chunks=chunks,
+            explanation=self._build_explanation(chunks),
+            sources=self._build_sources(chunks),
+            refinement_count=refinement_count,
+        )
+
+    def _build_verification_messages(
+        self,
+        context: ResolvedQueryContext,
+        attempt: AnswerAttempt,
+    ) -> list[Any]:
+        scope_label = context.resolved_doc_uuid or "all accessible documents"
+        exact_page_label = str(context.requested_page) if context.requested_page is not None else "none"
+        authorized_context = self._build_context(attempt.chunks)
+
+        return [
+            SystemMessage(
+                content=(
+                    "You are a grounding verifier for an enterprise RAG system. "
+                    "Check whether the draft answer is fully supported by the authorized context only. "
+                    "Return JSON only with keys: grounded, needs_more_retrieval, gap_query, reason, keep_document_scope. "
+                    "Set grounded=true only when all material claims in the draft answer are supported by the authorized context. "
+                    "Set needs_more_retrieval=true only when one more focused retrieval pass is likely to fix the evidence gap. "
+                    "Set gap_query to a compact retrieval query string or null. "
+                    "Set keep_document_scope=true when any additional retrieval should stay inside the currently resolved document scope. "
+                    "If the request targets an exact page and the current context from that page is insufficient, set grounded=false and needs_more_retrieval=false. "
+                    "Do not answer in prose. Return JSON only."
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f"User question:\n{context.query_text}\n\n"
+                    f"Resolved document scope:\n{scope_label}\n\n"
+                    f"Exact page requested:\n{exact_page_label}\n\n"
+                    f"Current refinement round:\n{attempt.refinement_count}\n\n"
+                    f"Draft answer:\n{attempt.answer}\n\n"
+                    f"Authorized context:\n{authorized_context}"
+                )
+            ),
+        ]
+
+    def _default_verification_result(
+        self,
+        query_text: str,
+        chunks: list[RetrievedChunk],
+        reason: str,
+    ) -> VerificationResult:
+        strong_enough = bool(chunks) and self._is_confident_enough(query_text, chunks)
+        return VerificationResult(
+            grounded=strong_enough,
+            needs_more_retrieval=False,
+            reason=normalize_text(reason) or "Verifier output could not be used safely.",
+            gap_query=None,
+        )
+
+    def _parse_verification_result(
+        self,
+        payload: str,
+        query_text: str,
+        chunks: list[RetrievedChunk],
+    ) -> VerificationResult:
+        try:
+            parsed = self._extract_json_object(payload)
+        except (ValueError, json.JSONDecodeError, TypeError) as exc:
+            return self._default_verification_result(
+                query_text=query_text,
+                chunks=chunks,
+                reason=f"Verifier output could not be parsed safely: {exc}",
+            )
+
+        grounded = self._coerce_bool(parsed.get("grounded"), False)
+        needs_more_retrieval = self._coerce_bool(parsed.get("needs_more_retrieval"), False)
+        keep_document_scope = self._coerce_bool(parsed.get("keep_document_scope"), True)
+        reason = normalize_text(parsed.get("reason") or "") or "Verifier did not provide a reason."
+        gap_query_text = normalize_text(parsed.get("gap_query") or "")
+
+        gap_query = None
+        if not grounded and needs_more_retrieval and gap_query_text:
+            gap_query = GapQuery(
+                text=gap_query_text,
+                reason=reason,
+                keep_document_scope=keep_document_scope,
+            )
+        else:
+            needs_more_retrieval = False
+
+        if grounded:
+            needs_more_retrieval = False
+            gap_query = None
+
+        return VerificationResult(
+            grounded=grounded,
+            needs_more_retrieval=needs_more_retrieval,
+            reason=reason,
+            gap_query=gap_query,
+        )
+
+    def _verify_answer_attempt(
+        self,
+        context: ResolvedQueryContext,
+        attempt: AnswerAttempt,
+    ) -> VerificationResult:
+        self._log_verifier(
+            context.query_text,
+            "START",
+            f"Verifying answer attempt {attempt.refinement_count + 1} with {len(attempt.chunks)} chunk(s).",
+        )
+
+        try:
+            response = self.llm.invoke(self._build_verification_messages(context, attempt))
+            payload = self._read_llm_text(response.content)
+            verification = self._parse_verification_result(
+                payload=payload,
+                query_text=context.query_text,
+                chunks=attempt.chunks,
+            )
+        except Exception as exc:
+            verification = self._default_verification_result(
+                query_text=context.query_text,
+                chunks=attempt.chunks,
+                reason=f"Verifier invocation failed: {exc}",
+            )
+
+        self._log_verifier(
+            context.query_text,
+            "RESULT",
+            (
+                f"grounded={verification.grounded} | "
+                f"needs_more_retrieval={verification.needs_more_retrieval} | "
+                f"reason={verification.reason}"
+            ),
+        )
+        return verification
+
+    def _prepare_query_context(
+        self,
+        query_text: str,
+        role: str,
+        chat_id: str | None,
+        doc_uuid: str | None,
+        chat_history: list[dict[str, Any]] | None,
+        top_k: int,
+    ) -> tuple[ResolvedQueryContext | None, QueryResult | None]:
         normalized_role = normalize_role(role)
         allowed_categories = allowed_categories_for_role(normalized_role)
         allowed_visibility_scopes = allowed_visibility_scopes_for_role(normalized_role)
         if not allowed_categories or not allowed_visibility_scopes:
-            return [], QueryResult(
+            return None, QueryResult(
                 answer="No accessible data found for your role",
                 explanation="Your role does not have access to any searchable document categories.",
                 sources=[],
             )
 
         if self._is_small_talk(query_text):
-            return [], self._answer_small_talk(query_text)
+            return None, self._answer_small_talk(query_text)
 
         normalized_history = self._normalize_chat_history(chat_history)
         resolved_doc_uuid = self._resolve_fixed_document_id(
@@ -2110,27 +2340,78 @@ class EnterpriseRAGService:
         if (doc_uuid and not resolved_doc_uuid) or (
             not doc_uuid and self._query_mentions_specific_document(query_text) and not resolved_doc_uuid
         ):
-            return [], QueryResult(
+            return None, QueryResult(
                 answer="No accessible data found for your role",
                 explanation="The request explicitly referenced a document that is deleted, unavailable, or outside your access scope.",
                 sources=[],
             )
 
-        requested_page = self._extract_requested_page(query_text)
-        if requested_page is not None and resolved_doc_uuid:
+        return ResolvedQueryContext(
+            query_text=query_text,
+            role=normalized_role,
+            chat_id=chat_id,
+            normalized_history=normalized_history,
+            resolved_doc_uuid=resolved_doc_uuid,
+            requested_page=self._extract_requested_page(query_text),
+            top_k=top_k,
+        ), None
+
+    def _retrieve_accessible_chunks(
+        self,
+        query_text: str,
+        context: ResolvedQueryContext,
+        document_scope: str | None,
+    ) -> list[RetrievedChunk]:
+        selected_chunks = self._run_agentic_enterprise_retrieval(
+            query_text=query_text,
+            role=context.role,
+            chat_history=context.normalized_history,
+            doc_uuid=document_scope,
+            top_k=context.top_k,
+        )
+
+        if selected_chunks:
+            return selected_chunks
+
+        planned_queries = self._plan_queries(query_text, context.normalized_history)
+        legacy_candidates: list[list[RetrievedChunk]] = []
+        for planned_query in planned_queries:
+            legacy_chunks = self._query_legacy_chunks(
+                query_text=planned_query.text,
+                chat_id=context.chat_id,
+                doc_uuid=document_scope,
+                top_k=context.top_k,
+            )
+            if legacy_chunks:
+                legacy_candidates.append(legacy_chunks)
+
+        if not legacy_candidates:
+            return []
+
+        return self._merge_ranked_chunks(
+            question=query_text,
+            chunk_groups=legacy_candidates,
+            top_k=clamp_top_k(context.top_k, DEFAULT_AGENT_TOP_K),
+        )
+
+    def _resolve_query_chunks(
+        self,
+        context: ResolvedQueryContext,
+    ) -> tuple[list[RetrievedChunk], QueryResult | None]:
+        if context.requested_page is not None and context.resolved_doc_uuid:
             exact_page_chunks = self._fetch_exact_page_chunks(
-                query_text=query_text,
-                role=normalized_role,
-                document_id=resolved_doc_uuid,
-                page_number=requested_page,
+                query_text=context.query_text,
+                role=context.role,
+                document_id=context.resolved_doc_uuid,
+                page_number=context.requested_page,
             )
             if exact_page_chunks:
                 return exact_page_chunks, None
 
-            document_label = self._get_document_label(resolved_doc_uuid)
+            document_label = self._get_document_label(context.resolved_doc_uuid)
             return [], QueryResult(
                 answer=(
-                    f"No extractable content was found on page {requested_page} of {document_label}."
+                    f"No extractable content was found on page {context.requested_page} of {document_label}."
                 ),
                 explanation=(
                     "The request targeted an exact page in a specific accessible document, "
@@ -2139,33 +2420,13 @@ class EnterpriseRAGService:
                 sources=[],
             )
 
-        selected_chunks = self._run_agentic_enterprise_retrieval(
-            query_text=query_text,
-            role=normalized_role,
-            chat_history=normalized_history,
-            doc_uuid=resolved_doc_uuid,
-            top_k=top_k,
+        selected_chunks = self._retrieve_accessible_chunks(
+            query_text=context.query_text,
+            context=context,
+            document_scope=context.resolved_doc_uuid,
         )
 
         if not selected_chunks:
-            planned_queries = self._plan_queries(query_text, normalized_history)
-            legacy_candidates: list[list[RetrievedChunk]] = []
-            for planned_query in planned_queries:
-                legacy_chunks = self._query_legacy_chunks(
-                    query_text=planned_query.text,
-                    chat_id=chat_id,
-                    doc_uuid=resolved_doc_uuid,
-                    top_k=top_k,
-                )
-                if legacy_chunks:
-                    legacy_candidates.append(legacy_chunks)
-            selected_chunks = self._merge_ranked_chunks(
-                question=query_text,
-                chunk_groups=legacy_candidates,
-                top_k=top_k,
-            )
-
-        if not selected_chunks or not self._is_confident_enough(query_text, selected_chunks):
             return [], QueryResult(
                 answer="No accessible data found for your role",
                 explanation="The agent searched accessible documents, including rewritten retrieval attempts, but did not find a strong enough grounded match for this question.",
@@ -2173,6 +2434,116 @@ class EnterpriseRAGService:
             )
 
         return selected_chunks, None
+
+    def _resolve_query(
+        self,
+        query_text: str,
+        role: str,
+        chat_id: str | None,
+        doc_uuid: str | None,
+        chat_history: list[dict[str, Any]] | None,
+        top_k: int,
+    ) -> tuple[list[RetrievedChunk], QueryResult | None]:
+        context, early_result = self._prepare_query_context(
+            query_text=query_text,
+            role=role,
+            chat_id=chat_id,
+            doc_uuid=doc_uuid,
+            chat_history=chat_history,
+            top_k=top_k,
+        )
+        if early_result is not None or context is None:
+            return [], early_result
+        return self._resolve_query_chunks(context)
+
+    def _run_verified_query(
+        self,
+        context: ResolvedQueryContext,
+        selected_chunks: list[RetrievedChunk],
+    ) -> QueryResult:
+        attempt = self._build_answer_attempt(
+            query_text=context.query_text,
+            chunks=selected_chunks,
+            refinement_count=0,
+        )
+        verification = self._verify_answer_attempt(context, attempt)
+        attempt = replace(attempt, verification=verification)
+
+        if verification.grounded and not verification.needs_more_retrieval:
+            self._log_verifier(context.query_text, "FINAL", "Initial answer verified successfully.")
+            return self._build_query_result_from_attempt(attempt)
+
+        if (
+            context.requested_page is None
+            and verification.needs_more_retrieval
+            and verification.gap_query is not None
+            and attempt.refinement_count < MAX_VERIFICATION_REFINEMENTS
+        ):
+            refinement_scope = (
+                context.resolved_doc_uuid
+                if context.resolved_doc_uuid and verification.gap_query.keep_document_scope
+                else None
+            )
+            scope_label = refinement_scope or "all accessible documents"
+            self._log_verifier(
+                context.query_text,
+                "REFINE",
+                f'Rerunning retrieval with "{verification.gap_query.text}" | scope={scope_label}',
+            )
+            refined_chunks = self._retrieve_accessible_chunks(
+                query_text=verification.gap_query.text,
+                context=context,
+                document_scope=refinement_scope,
+            )
+            if refined_chunks:
+                merged_chunks = self._merge_ranked_chunks(
+                    question=context.query_text,
+                    chunk_groups=[attempt.chunks, refined_chunks],
+                    top_k=clamp_top_k(context.top_k, DEFAULT_AGENT_TOP_K),
+                )
+                merged_chunks = self._finalize_selected_chunks(
+                    context.query_text,
+                    merged_chunks,
+                    top_k=clamp_top_k(context.top_k, DEFAULT_AGENT_TOP_K),
+                )
+
+                if merged_chunks:
+                    refined_attempt = self._build_answer_attempt(
+                        query_text=context.query_text,
+                        chunks=merged_chunks,
+                        refinement_count=attempt.refinement_count + 1,
+                    )
+                    refined_verification = self._verify_answer_attempt(context, refined_attempt)
+                    refined_attempt = replace(refined_attempt, verification=refined_verification)
+
+                    if refined_verification.grounded and not refined_verification.needs_more_retrieval:
+                        self._log_verifier(
+                            context.query_text,
+                            "FINAL",
+                            "Refined answer verified successfully.",
+                        )
+                        return self._build_query_result_from_attempt(refined_attempt)
+
+                    self._log_verifier(
+                        context.query_text,
+                        "FINAL",
+                        "Refined answer still failed grounding verification.",
+                    )
+                    return self._build_verifier_insufficiency_result(refined_verification.reason)
+
+            self._log_verifier(
+                context.query_text,
+                "FINAL",
+                "Verifier requested refinement but no stronger evidence was found.",
+            )
+            return self._build_verifier_insufficiency_result(verification.reason)
+
+        self._log_verifier(
+            context.query_text,
+            "FINAL",
+            "Grounding verification rejected the draft answer without a safe refinement path.",
+        )
+        return self._build_verifier_insufficiency_result(verification.reason)
 
     def query(
         self,
@@ -2183,7 +2554,7 @@ class EnterpriseRAGService:
         chat_history: list[dict[str, Any]] | None = None,
         top_k: int = 4,
     ) -> QueryResult:
-        selected_chunks, early_result = self._resolve_query(
+        context, early_result = self._prepare_query_context(
             query_text=query_text,
             role=role,
             chat_id=chat_id,
@@ -2193,14 +2564,16 @@ class EnterpriseRAGService:
         )
         if early_result is not None:
             return early_result
+        if context is None:
+            return self._build_verifier_insufficiency_result(
+                "The request could not be prepared for verified retrieval."
+            )
 
-        answer = self._generate_answer(query_text, selected_chunks)
-        sources = self._build_sources(selected_chunks)
-        return QueryResult(
-            answer=answer,
-            explanation=self._build_explanation(selected_chunks),
-            sources=sources,
-        )
+        selected_chunks, chunk_error = self._resolve_query_chunks(context)
+        if chunk_error is not None:
+            return chunk_error
+
+        return self._run_verified_query(context, selected_chunks)
 
     def stream_query(
         self,
@@ -2211,7 +2584,7 @@ class EnterpriseRAGService:
         chat_history: list[dict[str, Any]] | None = None,
         top_k: int = 4,
     ):
-        selected_chunks, early_result = self._resolve_query(
+        context, early_result = self._prepare_query_context(
             query_text=query_text,
             role=role,
             chat_id=chat_id,
@@ -2229,25 +2602,36 @@ class EnterpriseRAGService:
             }
             return
 
-        streamed_parts: list[str] = []
-        try:
-            for delta in self._stream_answer(query_text, selected_chunks):
-                streamed_parts.append(delta)
+        if context is None:
+            fallback_result = self._build_verifier_insufficiency_result(
+                "The request could not be prepared for verified retrieval."
+            )
+            yield {
+                "type": "final",
+                "answer": fallback_result.answer,
+                "explanation": fallback_result.explanation,
+                "sources": [source.model_dump() for source in fallback_result.sources],
+            }
+            return
+
+        selected_chunks, chunk_error = self._resolve_query_chunks(context)
+        if chunk_error is not None:
+            yield {
+                "type": "final",
+                "answer": chunk_error.answer,
+                "explanation": chunk_error.explanation,
+                "sources": [source.model_dump() for source in chunk_error.sources],
+            }
+            return
+
+        verified_result = self._run_verified_query(context, selected_chunks)
+        for delta in self._stream_text_chunks(verified_result.answer):
+            if delta:
                 yield {"type": "token", "delta": delta}
-        except Exception:
-            if not streamed_parts:
-                fallback_answer = self._generate_answer(query_text, selected_chunks)
-                streamed_parts.append(fallback_answer)
-                yield {"type": "token", "delta": fallback_answer}
 
-        answer = normalize_text("".join(streamed_parts))
-        if not answer:
-            answer = self._generate_answer(query_text, selected_chunks)
-
-        sources = self._build_sources(selected_chunks)
         yield {
             "type": "final",
-            "answer": answer,
-            "explanation": self._build_explanation(selected_chunks),
-            "sources": [source.model_dump() for source in sources],
+            "answer": verified_result.answer,
+            "explanation": verified_result.explanation,
+            "sources": [source.model_dump() for source in verified_result.sources],
         }

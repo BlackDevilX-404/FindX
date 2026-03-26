@@ -5,6 +5,11 @@ An AI-powered enterprise search system that understands natural language queries
 
 FindX is an enterprise agentic RAG prototype with a FastAPI backend and a React frontend. It combines JWT authentication, MongoDB-based user storage, ChromaDB vector search, sentence-transformer embeddings, and Groq-powered answer generation.
 
+Supplementary root guides:
+
+- `PROJECT_PRESENTATION_GUIDE.md` for presentation framing
+- `FULL_SYSTEM_TEST_GUIDE.md` for end-to-end validation
+
 The current system focuses on:
 
 - secure login with roles
@@ -66,15 +71,44 @@ The main behavior is:
 - seeded demo users
 - RBAC for upload and query endpoints
 - RBS through category-based Chroma filters
+- follow-up query rewriting for underspecified chat turns
+- multi-attempt retrieval planning and evidence merging
+- verifier-backed final answers with one safe refinement round
 - grounded answer generation
 - source snippets returned to the UI
 - query logging in MongoDB
+- shorthand document resolution such as `ITC pdf`
 - exact-page retrieval when a query targets a specific page in a resolved document
 - legacy per-workspace compatibility search
 - simple ChatGPT-inspired dark UI
 - evidence viewer sidebar
 - collapsible history and ingest sidebar
 - optional browser microphone input
+
+### Current RAG Level
+
+Current level:
+
+- retrieval-focused enterprise agentic RAG with verifier-backed grounding
+
+Old or earlier baseline in this repo:
+
+- secure single-pass RAG over role-filtered chunks
+- answer generation immediately after retrieval
+- weaker handling of follow-up ambiguity
+- no exact-page-first route for page-targeted questions
+- no explicit draft-answer verification loop before final output
+
+New or current behavior:
+
+- rewrites short follow-up questions into clearer retrieval queries
+- plans multiple retrieval attempts and merges ranked evidence
+- resolves shorthand document mentions to accessible enterprise documents
+- routes page-specific questions to exact-page retrieval when the document can be resolved
+- generates a draft answer, verifies grounding, and can refine retrieval once before finalizing
+- returns insufficiency when evidence cannot be verified safely instead of speculating
+- streams the verified final answer rather than an unverified draft
+- keeps legacy workspace retrieval only as a compatibility fallback
 
 ## 4. Architecture Overview
 
@@ -95,7 +129,7 @@ MongoDB
 ChromaDB
   -> vector chunks with metadata
 Groq LLM
-  -> query rewriting, routing, grounded answer generation, and response streaming
+  -> query rewriting, routing, grounding verification, answer generation, and response streaming
 ```
 
 ### Request Flow for `/api/chat` and `/api/chat/stream`
@@ -109,8 +143,9 @@ Groq LLM
 7. Otherwise, for document-grounded questions, it can rewrite short follow-ups into standalone retrieval queries.
 8. ChromaDB is queried with category and visibility filters, and multiple retrieval attempts are merged and ranked.
 9. If enterprise chunks are unavailable, the backend may use the legacy workspace store as a compatibility fallback.
-10. The LLM receives only the selected authorized context.
-11. Backend returns a normal JSON response on `/api/chat`, or NDJSON token/final events on `/api/chat/stream`.
+10. The LLM first generates a draft answer from the selected authorized context.
+11. A verifier pass checks grounding, can request one focused retrieval refinement, and rejects unsupported drafts.
+12. Backend returns a verified normal JSON response on `/api/chat`, or NDJSON token/final events on `/api/chat/stream`.
 
 Standard response shape:
 
@@ -170,6 +205,7 @@ FindX/
 |  |  `- components/
 |  `- package.json
 |- requirements.txt
+|- FULL_SYSTEM_TEST_GUIDE.md
 `- README.md
 ```
 
@@ -274,10 +310,12 @@ Responsibilities:
 - resolve shorthand document mentions such as `ITC pdf` to a concrete accessible document when possible
 - short-circuit to exact-page retrieval when a query targets a specific page in a resolved document
 - run multiple retrieval attempts and merge ranked evidence
-- gate weak results
+- verify draft answers against authorized context
+- optionally run one focused refinement retrieval round
+- return insufficiency when evidence cannot be verified safely
 - batch large Chroma metadata updates and deletes to stay under collection limits
 - call Groq with authorized context only
-- stream grounded answer tokens
+- stream verified grounded answer tokens
 - return structured answer, explanation, and sources
 
 ### `Backend/pdf_chroma_ingest.py`
@@ -987,15 +1025,22 @@ npm run build
 
 ## 23. Current Project Status
 
-The project is already functional as an enterprise agentic RAG prototype with:
+Old level:
 
-- login
-- role-aware search
-- grounded answers
-- streaming chat responses
-- evidence display
+- secure role-aware RAG prototype
+- grounded retrieval with evidence snippets
+- streaming chat and admin upload flow
+
+New current level:
+
+- retrieval-focused enterprise agentic RAG
+- follow-up rewrite and multi-attempt retrieval planning
+- shorthand document resolution and exact-page retrieval
+- verifier-backed answer finalization with one refinement round
+- safe insufficiency behavior for unsupported questions
 - admin upload flow with batched indexing progress in the backend terminal
-- query logging
+- batched Chroma visibility updates and deletes
+- query logging and evidence display
 
 The best next milestone is to finish the migration from partially local frontend document state to a fully backend-driven document lifecycle.
 >>>>>>> 79fd667 (Bibin, refined rag approach with chatgpt clean theme)
