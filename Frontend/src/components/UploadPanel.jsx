@@ -35,7 +35,7 @@ function UploadPanel({
             <input
               type="file"
               multiple
-              accept=".pdf,.ppt,.pptx"
+              accept=".pdf,.ppt,.pptx,.docx,.txt,.md,.csv,.json,.xlsx"
               onChange={onFileUpload}
               className="hidden"
             />

@@ -1,6 +1,8 @@
 import os
+import json
 import re
 import uuid
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -10,8 +12,10 @@ import fitz
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
+from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
+from docx import Document as DocxDocument
 
 try:
     from .auth import ROLE_ADMIN, ROLE_DEVELOPER, ROLE_HR
@@ -78,6 +82,27 @@ MIN_HIGH_CONFIDENT_SCORE = 0.60
 MIN_CONFIDENT_SCORE = 0.30
 MIN_LEXICAL_OVERLAP = 0.08
 MIN_LIGHT_OVERLAP = 0.04
+FOLLOW_UP_HINTS = {
+    "it",
+    "its",
+    "they",
+    "them",
+    "that",
+    "those",
+    "this",
+    "these",
+    "he",
+    "she",
+    "their",
+    "there",
+    "same",
+}
+SMALL_TALK_PATTERNS = [
+    re.compile(r"^(hi|hello|hey)( there)?[!. ]*$", re.IGNORECASE),
+    re.compile(r"^good (morning|afternoon|evening)[!. ]*$", re.IGNORECASE),
+    re.compile(r"^(thanks|thank you|ok thanks)[!. ]*$", re.IGNORECASE),
+    re.compile(r"^(who are you|what can you do)\??$", re.IGNORECASE),
+]
 
 
 class SourceItem(BaseModel):
@@ -111,6 +136,12 @@ class RetrievedChunk:
     score: float
 
 
+@dataclass
+class PlannedQuery:
+    text: str
+    reason: str
+
+
 def normalize_text(text: str) -> str:
     normalized = (
         (text or "")
@@ -125,7 +156,13 @@ def normalize_text(text: str) -> str:
 
 
 def split_paragraphs(text: str) -> list[str]:
-    return [paragraph.strip() for paragraph in re.split(r"\n{2,}", text) if len(paragraph.strip()) > 40]
+    paragraphs = [paragraph.strip() for paragraph in re.split(r"\n{2,}", text) if paragraph.strip()]
+    long_paragraphs = [paragraph for paragraph in paragraphs if len(paragraph) > 40]
+    if long_paragraphs:
+        return long_paragraphs
+
+    normalized = normalize_text(text)
+    return [normalized] if normalized else []
 
 
 def sentence_chunks(text: str) -> list[str]:
@@ -206,6 +243,10 @@ def format_confidence(score: float) -> str:
     return f"{percentage}%"
 
 
+def build_metadata_payload(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in metadata.items() if value is not None}
+
+
 class EnterpriseRAGService:
     _chroma_client = None
     _embedder: Optional[SentenceTransformer] = None
@@ -247,7 +288,9 @@ class EnterpriseRAGService:
             return file_path
 
         if extension not in {".ppt", ".pptx"}:
-            raise ValueError("Unsupported file type. Only PDF, PPT, and PPTX are supported.")
+            raise ValueError(
+                "Unsupported file type. Supported formats: PDF, PPT, PPTX, DOCX, TXT, MD, CSV, JSON, XLSX."
+            )
 
         relative_base = Path("downloads") / file_path.stem
         converter = Ppt2Pdf(str(relative_base).replace("\\", "/"), extension[1:])
@@ -258,6 +301,92 @@ class EnterpriseRAGService:
             raise ValueError("PPT conversion failed. PDF output was not created.")
 
         return pdf_path
+
+    def _extract_docx_pages(self, file_path: Path) -> list[dict[str, Any]]:
+        document = DocxDocument(file_path)
+        blocks: list[str] = []
+
+        for paragraph in document.paragraphs:
+            text = normalize_text(paragraph.text)
+            if text:
+                blocks.append(text)
+
+        for table in document.tables:
+            row_texts: list[str] = []
+            for row in table.rows:
+                cells = [normalize_text(cell.text) for cell in row.cells if normalize_text(cell.text)]
+                if cells:
+                    row_texts.append(" | ".join(cells))
+            if row_texts:
+                blocks.append("\n".join(row_texts))
+
+        combined = "\n\n".join(blocks).strip()
+        if not combined:
+            return []
+
+        return [{"page": 1, "text": combined}]
+
+    def _extract_spreadsheet_pages(self, file_path: Path) -> list[dict[str, Any]]:
+        workbook = load_workbook(filename=file_path, read_only=True, data_only=True)
+        pages: list[dict[str, Any]] = []
+
+        try:
+            for sheet_index, sheet in enumerate(workbook.worksheets, start=1):
+                rows: list[str] = []
+                for row in sheet.iter_rows(values_only=True):
+                    cells = [normalize_text(str(cell)) for cell in row if cell is not None and normalize_text(str(cell))]
+                    if cells:
+                        rows.append(" | ".join(cells))
+
+                sheet_text = normalize_text(f"Sheet: {sheet.title}\n\n" + "\n".join(rows))
+                if sheet_text:
+                    pages.append({"page": sheet_index, "text": sheet_text})
+        finally:
+            workbook.close()
+
+        return pages
+
+    def _extract_text_file_pages(self, file_path: Path) -> list[dict[str, Any]]:
+        extension = file_path.suffix.lower()
+
+        if extension == ".csv":
+            with file_path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
+                reader = csv.reader(handle)
+                rows = [" | ".join(normalize_text(cell) for cell in row if normalize_text(cell)) for row in reader]
+                text = "\n".join(row for row in rows if row.strip())
+        elif extension == ".json":
+            raw = file_path.read_text(encoding="utf-8", errors="ignore")
+            try:
+                parsed = json.loads(raw)
+                text = json.dumps(parsed, indent=2, ensure_ascii=True)
+            except json.JSONDecodeError:
+                text = raw
+        else:
+            text = file_path.read_text(encoding="utf-8", errors="ignore")
+
+        normalized = normalize_text(text)
+        if not normalized:
+            return []
+
+        return [{"page": 1, "text": normalized}]
+
+    def _extract_pages_from_file(self, file_path: Path) -> list[dict[str, Any]]:
+        extension = file_path.suffix.lower()
+
+        if extension == ".pdf":
+            return self._extract_pages(file_path)
+        if extension in {".ppt", ".pptx"}:
+            return self._extract_pages(self._convert_to_pdf_if_needed(file_path))
+        if extension == ".docx":
+            return self._extract_docx_pages(file_path)
+        if extension == ".xlsx":
+            return self._extract_spreadsheet_pages(file_path)
+        if extension in {".txt", ".md", ".csv", ".json"}:
+            return self._extract_text_file_pages(file_path)
+
+        raise ValueError(
+            "Unsupported file type. Supported formats: PDF, PPT, PPTX, DOCX, TXT, MD, CSV, JSON, XLSX."
+        )
 
     def _extract_pages(self, pdf_path: Path) -> list[dict[str, Any]]:
         document = fitz.open(pdf_path)
@@ -293,8 +422,7 @@ class EnterpriseRAGService:
         uploaded_by: str,
     ) -> IngestResult:
         validated_category = validate_category(category)
-        pdf_path = self._convert_to_pdf_if_needed(file_path)
-        pages = self._extract_pages(pdf_path)
+        pages = self._extract_pages_from_file(file_path)
         chunks = self._chunk_pages(pages)
 
         if not chunks:
@@ -314,14 +442,16 @@ class EnterpriseRAGService:
             documents=texts,
             embeddings=embeddings,
             metadatas=[
-                {
-                    "document_id": document_id,
-                    "document": document_name,
-                    "category": validated_category,
-                    "sensitivity": sensitivity,
-                    "page": chunk["page"],
-                    "uploaded_by": uploaded_by,
-                }
+                build_metadata_payload(
+                    {
+                        "document_id": document_id,
+                        "document": document_name,
+                        "category": validated_category,
+                        "sensitivity": sensitivity,
+                        "page": chunk["page"],
+                        "uploaded_by": uploaded_by,
+                    }
+                )
                 for chunk in chunks
             ],
         )
@@ -378,6 +508,134 @@ class EnterpriseRAGService:
                 break
 
         return selected
+
+    @staticmethod
+    def _extract_message_text(message: dict[str, Any]) -> str:
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return normalize_text(content)
+
+        text = message.get("text")
+        if isinstance(text, str) and text.strip():
+            return normalize_text(text)
+
+        return ""
+
+    def _normalize_chat_history(self, chat_history: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+        normalized_history: list[dict[str, str]] = []
+        for message in chat_history or []:
+            role = str(message.get("role") or "").strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+
+            text = self._extract_message_text(message)
+            if not text:
+                continue
+
+            normalized_history.append({"role": role, "content": text})
+
+        return normalized_history[-6:]
+
+    @staticmethod
+    def _history_to_text(chat_history: list[dict[str, str]]) -> str:
+        if not chat_history:
+            return "No prior conversation."
+
+        lines = []
+        for message in chat_history:
+            speaker = "User" if message["role"] == "user" else "Assistant"
+            lines.append(f"{speaker}: {message['content']}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _is_small_talk(query_text: str) -> bool:
+        normalized = query_text.strip()
+        return any(pattern.match(normalized) for pattern in SMALL_TALK_PATTERNS)
+
+    @staticmethod
+    def _looks_like_follow_up(query_text: str) -> bool:
+        normalized = normalize_text(query_text).lower()
+        if len(normalized.split()) <= 5:
+            return True
+
+        tokens = set(WORD_PATTERN.findall(normalized))
+        return any(token in FOLLOW_UP_HINTS for token in tokens)
+
+    def _rewrite_query_with_history(
+        self,
+        query_text: str,
+        chat_history: list[dict[str, str]],
+    ) -> str:
+        if not chat_history:
+            return query_text
+
+        response = self.llm.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "Rewrite the user's latest question into a standalone enterprise search query. "
+                        "Preserve intent, include missing references from the conversation, and return only the rewritten query. "
+                        "If no rewrite is needed, return the original question."
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        f"Conversation:\n{self._history_to_text(chat_history)}\n\n"
+                        f"Latest question:\n{query_text}"
+                    )
+                ),
+            ]
+        )
+
+        rewritten = normalize_text(self._read_llm_text(response.content))
+        return rewritten or query_text
+
+    def _generate_keyword_query(self, query_text: str) -> str:
+        response = self.llm.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "Convert the user's request into a compact retrieval query for enterprise documents. "
+                        "Keep only the core subject, constraints, and policy terms. Return one line only."
+                    )
+                ),
+                HumanMessage(content=query_text),
+            ]
+        )
+        keyword_query = normalize_text(self._read_llm_text(response.content))
+        return keyword_query or query_text
+
+    @staticmethod
+    def _read_llm_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            return "\n".join(
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+
+        return ""
+
+    def _plan_queries(
+        self,
+        query_text: str,
+        chat_history: list[dict[str, str]],
+    ) -> list[PlannedQuery]:
+        planned_queries = [PlannedQuery(text=normalize_text(query_text), reason="original user question")]
+
+        if chat_history and self._looks_like_follow_up(query_text):
+            rewritten = self._rewrite_query_with_history(query_text, chat_history)
+            if rewritten and rewritten.lower() != planned_queries[0].text.lower():
+                planned_queries.append(PlannedQuery(text=rewritten, reason="rewritten follow-up with conversation context"))
+
+        keyword_query = self._generate_keyword_query(planned_queries[0].text)
+        if keyword_query and all(keyword_query.lower() != item.text.lower() for item in planned_queries):
+            planned_queries.append(PlannedQuery(text=keyword_query, reason="compressed retrieval query"))
+
+        return planned_queries
 
     def _filter_results_by_allowed_categories(
         self,
@@ -472,6 +730,32 @@ class EnterpriseRAGService:
             if normalize_text(chunk.text)
         ]
 
+    @staticmethod
+    def _merge_ranked_chunks(question: str, chunk_groups: list[list[RetrievedChunk]], top_k: int) -> list[RetrievedChunk]:
+        scored: list[RetrievedChunk] = []
+        seen: set[tuple[str, Optional[int], str]] = set()
+
+        for chunk_group in chunk_groups:
+            for chunk in chunk_group:
+                fingerprint = (chunk.document, chunk.page, chunk.text[:180])
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                rescored = round((chunk.score * 0.82) + (keyword_overlap(question, chunk.text) * 0.18), 4)
+                scored.append(
+                    RetrievedChunk(
+                        document=chunk.document,
+                        category=chunk.category,
+                        sensitivity=chunk.sensitivity,
+                        page=chunk.page,
+                        text=chunk.text,
+                        score=rescored,
+                    )
+                )
+
+        scored.sort(key=lambda item: item.score, reverse=True)
+        return scored[:top_k]
+
     def _is_confident_enough(self, question: str, chunks: list[RetrievedChunk]) -> bool:
         if not chunks:
             return False
@@ -548,6 +832,25 @@ class EnterpriseRAGService:
 
         return "No accessible data found for your role"
 
+    def _answer_small_talk(self, query_text: str) -> QueryResult:
+        response = self.llm.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "You are FindX, an enterprise document assistant. "
+                        "Respond briefly to greetings or capability questions."
+                    )
+                ),
+                HumanMessage(content=query_text),
+            ]
+        )
+        answer = normalize_text(self._read_llm_text(response.content))
+        return QueryResult(
+            answer=answer or "Hello. I can help you search the indexed company documents you are allowed to access.",
+            explanation="No document retrieval was needed because this request was conversational rather than document-specific.",
+            sources=[],
+        )
+
     def _build_explanation(self, chunks: list[RetrievedChunk]) -> str:
         if not chunks:
             return "No accessible data found for your role"
@@ -573,6 +876,7 @@ class EnterpriseRAGService:
         role: str,
         chat_id: str | None = None,
         doc_uuid: str | None = None,
+        chat_history: list[dict[str, Any]] | None = None,
         top_k: int = 4,
     ) -> QueryResult:
         normalized_role = normalize_role(role)
@@ -584,26 +888,49 @@ class EnterpriseRAGService:
                 sources=[],
             )
 
-        enterprise_chunks = self._query_enterprise_chunks(
-            query_text=query_text,
-            role=normalized_role,
-            top_k=top_k,
-        )
-        if enterprise_chunks:
-            selected_chunks = enterprise_chunks
-        else:
-            legacy_chunks = self._query_legacy_chunks(
-                query_text=query_text,
-                chat_id=chat_id,
-                doc_uuid=doc_uuid,
+        if self._is_small_talk(query_text):
+            return self._answer_small_talk(query_text)
+
+        normalized_history = self._normalize_chat_history(chat_history)
+        planned_queries = self._plan_queries(query_text, normalized_history)
+
+        enterprise_candidates: list[list[RetrievedChunk]] = []
+        for planned_query in planned_queries:
+            enterprise_chunks = self._query_enterprise_chunks(
+                query_text=planned_query.text,
+                role=normalized_role,
                 top_k=top_k,
             )
-            selected_chunks = legacy_chunks
+            if enterprise_chunks:
+                enterprise_candidates.append(enterprise_chunks)
+
+        selected_chunks = self._merge_ranked_chunks(
+            question=query_text,
+            chunk_groups=enterprise_candidates,
+            top_k=top_k,
+        )
+
+        if not selected_chunks:
+            legacy_candidates: list[list[RetrievedChunk]] = []
+            for planned_query in planned_queries:
+                legacy_chunks = self._query_legacy_chunks(
+                    query_text=planned_query.text,
+                    chat_id=chat_id,
+                    doc_uuid=doc_uuid,
+                    top_k=top_k,
+                )
+                if legacy_chunks:
+                    legacy_candidates.append(legacy_chunks)
+            selected_chunks = self._merge_ranked_chunks(
+                question=query_text,
+                chunk_groups=legacy_candidates,
+                top_k=top_k,
+            )
 
         if not selected_chunks or not self._is_confident_enough(query_text, selected_chunks):
             return QueryResult(
                 answer="No accessible data found for your role",
-                explanation="The accessible documents did not contain a strong enough match for this question.",
+                explanation="The agent searched accessible documents, including rewritten retrieval attempts, but did not find a strong enough grounded match for this question.",
                 sources=[],
             )
 

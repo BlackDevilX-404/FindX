@@ -15,3 +15,5 @@ PyJWT
 python-multipart
 email-validator
 aspose.slides
+python-docx
+openpyxl

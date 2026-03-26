@@ -10,6 +10,8 @@ function AdminDashboard({
   onDocumentVisibilityChange,
   onDeleteDocument,
 }) {
+  const displayName = currentUser.name ?? currentUser.username ?? currentUser.email ?? 'Admin'
+
   return (
     <main className="mt-4 grid flex-1 gap-4 xl:min-h-0 xl:grid-cols-[minmax(0,1fr)_320px] xl:overflow-hidden">
       <section className="flex flex-col rounded-3xl border border-white/10 bg-[#171717] p-4 xl:min-h-0">
@@ -71,7 +73,7 @@ function AdminDashboard({
         />
 
         <section className="rounded-3xl border border-white/10 bg-[#171717] p-4">
-          <h2 className="text-sm font-medium text-white">{currentUser.name}</h2>
+          <h2 className="text-sm font-medium text-white">{displayName}</h2>
           <p className="mt-2 text-sm text-zinc-400">
             Admin access for document upload, visibility control, and cleanup.
           </p>

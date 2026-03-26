@@ -35,8 +35,8 @@ bootstrap_database()
 rag_service = EnterpriseRAGService()
 
 app = FastAPI(
-    title="FindX Enterprise RAG API",
-    description="FastAPI backend with JWT auth, RBAC, and role-based search over ChromaDB",
+    title="FindX Enterprise Agentic RAG API",
+    description="FastAPI backend with JWT auth, RBAC, agentic retrieval orchestration, and role-based search over ChromaDB",
     version="2.0.0",
 )
 
@@ -175,6 +175,7 @@ async def query_documents(
             role=current_user["role"],
             chat_id=_resolve_query_scope(request, current_user),
             doc_uuid=request.doc_uuid,
+            chat_history=request.chat_history,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Query failed: {exc}") from exc

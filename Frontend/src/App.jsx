@@ -61,9 +61,40 @@ function sortConversations(conversations) {
 
 function normalizeDocuments(documents) {
   return documents.map((document) => {
+    const numericKeyFilename = Object.keys(document)
+      .filter((key) => /^\d+$/.test(key))
+      .sort((left, right) => Number(left) - Number(right))
+      .map((key) => document[key])
+      .join('')
+
+    const filename =
+      document.name ??
+      document.document ??
+      document.fileName ??
+      document.title ??
+      (numericKeyFilename || null) ??
+      'Uploaded file'
+
+    const normalizedDocument = {
+      ...document,
+      id: document.id ?? document.document_id ?? crypto.randomUUID(),
+      name: filename,
+      type: document.type ?? getFileTypeLabel(filename),
+      ownerId: document.ownerId ?? document.uploaded_by ?? 'unknown-owner',
+      ownerName:
+        document.ownerName ??
+        document.uploadedBy ??
+        document.uploaded_by ??
+        document.owner ??
+        'Unknown owner',
+      summary:
+        document.summary ??
+        `Indexed ${document.chunks_indexed ?? 0} chunk(s) in ${document.category ?? 'GENERAL'} category.`,
+    }
+
     if (document.visibilityScope) {
       return {
-        ...document,
+        ...normalizedDocument,
         visibilityScope: normalizeVisibilityScope(document.visibilityScope),
       }
     }
@@ -77,13 +108,14 @@ function normalizeDocuments(documents) {
       const { visibleTo, ...rest } = document
 
       return {
+        ...normalizedDocument,
         ...rest,
         visibilityScope,
       }
     }
 
     return {
-      ...document,
+      ...normalizedDocument,
       visibilityScope: 'private',
     }
   })
@@ -111,6 +143,33 @@ function normalizeSource(source, index) {
     confidence: source?.confidence ?? 'Source-backed',
     text: source?.text ?? source?.snippet ?? '',
     mode: 'retrieval',
+  }
+}
+
+function getFileTypeLabel(filename) {
+  const extension = String(filename || '').split('.').pop()?.toUpperCase()
+  return extension && extension !== String(filename || '').toUpperCase() ? extension : 'FILE'
+}
+
+function buildUploadedDocument(result, currentUser) {
+  const filename = result?.document ?? 'Uploaded file'
+  const ownerName =
+    currentUser?.name ??
+    currentUser?.username ??
+    currentUser?.email ??
+    'Unknown owner'
+
+  return {
+    id: result?.document_id ?? crypto.randomUUID(),
+    name: filename,
+    type: getFileTypeLabel(filename),
+    ownerId: currentUser?.id ?? 'unknown-owner',
+    ownerName,
+    uploadedAt: 'Just now',
+    visibilityScope: 'private',
+    summary: `Indexed ${result?.chunks_indexed ?? 0} chunk(s) in ${result?.category ?? 'GENERAL'} category.`,
+    category: result?.category ?? 'GENERAL',
+    sensitivity: result?.sensitivity ?? null,
   }
 }
 
@@ -422,7 +481,7 @@ function App() {
         text: response.answer,
         explanation:
           response.explanation ||
-          'This answer is grounded in the highest-ranked document passages returned by the backend.',
+          'This answer is grounded in the document evidence selected by the backend agent.',
         sources,
         createdAt: new Date().toISOString(),
       }
@@ -450,7 +509,7 @@ function App() {
         kind: 'response',
         text: error.message || 'The backend could not answer this query.',
         explanation:
-          'The request reached the server, but retrieval or grounded generation failed before a complete answer was returned.',
+          'The request reached the server, but the backend agent could not complete retrieval or grounded generation.',
         sources: [],
         createdAt: new Date().toISOString(),
       }
@@ -497,11 +556,10 @@ function App() {
       )
 
       const nextDocuments = results
-        .map((result) => result.document)
+        .map((result) => buildUploadedDocument(result, currentUser))
         .filter(Boolean)
         .map((document) => ({
           ...document,
-          uploadedAt: 'Just now',
           visibilityScope: normalizeVisibilityScope(document.visibilityScope),
         }))
 
