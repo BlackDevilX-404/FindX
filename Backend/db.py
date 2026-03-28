@@ -44,6 +44,8 @@ def ensure_indexes() -> None:
     documents_col.create_index([("document_id", ASCENDING)], unique=True)
     documents_col.create_index([("category", ASCENDING)])
     documents_col.create_index([("uploaded_by", ASCENDING)])
+    documents_col.create_index([("system_id", ASCENDING)])
+    documents_col.create_index([("system_id", ASCENDING), ("uploaded_by", ASCENDING)])
     query_logs_col.create_index([("username", ASCENDING)])
     query_logs_col.create_index([("timestamp", DESCENDING)])
 
@@ -124,6 +126,7 @@ def store_document_record(
     visibility_scope: str,
     uploaded_by: str,
     chunks_indexed: int,
+    system_id: str,
 ) -> None:
     documents_col.update_one(
         {"document_id": document_id},
@@ -136,6 +139,7 @@ def store_document_record(
                 "visibility_scope": visibility_scope,
                 "uploaded_by": uploaded_by,
                 "chunks_indexed": chunks_indexed,
+                "system_id": system_id,
                 "updated_at": datetime.now(timezone.utc),
             },
             "$setOnInsert": {
@@ -156,7 +160,27 @@ def update_document_visibility(document_id: str, visibility_scope: str) -> bool:
             }
         },
     )
-    return result.matched_count > 0
+    
+    if result.matched_count == 0:
+        print(f"[DB Warning] Document {document_id} not found for visibility update", flush=True)
+        return False
+    
+    if result.modified_count == 0:
+        print(f"[DB Info] Document {document_id} visibility already set to '{visibility_scope}'", flush=True)
+        return True
+    
+    # Verify the update was successful
+    updated_doc = documents_col.find_one({"document_id": document_id})
+    if updated_doc and updated_doc.get("visibility_scope") == visibility_scope:
+        print(f"[DB] Document {document_id} visibility confirmed updated to '{visibility_scope}'", flush=True)
+        return True
+    else:
+        print(
+            f"[DB ERROR] Failed to verify visibility update for document {document_id}. "
+            f"Expected '{visibility_scope}' but got '{updated_doc.get('visibility_scope') if updated_doc else 'NOT FOUND'}'",
+            flush=True
+        )
+        return False
 
 
 def delete_document_record(document_id: str) -> bool:
@@ -164,8 +188,21 @@ def delete_document_record(document_id: str) -> bool:
     return result.deleted_count > 0
 
 
-def list_document_records() -> list[dict[str, Any]]:
-    return list(documents_col.find({}, {"_id": 0}))
+def list_document_records(system_id: str | None = None) -> list[dict[str, Any]]:
+    """
+    List document records, optionally filtered by system_id.
+    
+    Args:
+        system_id: Optional system identifier to filter documents. If provided,
+                  only documents uploaded from that system are returned.
+    
+    Returns:
+        List of document records matching the criteria.
+    """
+    query = {}
+    if system_id:
+        query["system_id"] = system_id
+    return list(documents_col.find(query, {"_id": 0}))
 
 
 def log_query(username: str, role: str, query: str) -> None:

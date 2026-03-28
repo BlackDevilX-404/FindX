@@ -162,18 +162,75 @@ export async function sendChatMessageStream({
   return finalEvent
 }
 
-export function uploadFileToSession({ token, sessionId, file, visibilityScope }) {
+export function uploadFileToSession({
+  token,
+  sessionId,
+  file,
+  visibilityScope,
+  uploadId,
+  onProgress,
+  onUploadComplete,
+}) {
   const formData = new FormData()
   formData.append('session_id', sessionId)
   formData.append('file', file)
   formData.append('visibility_scope', visibilityScope)
+  formData.append('upload_id', uploadId)
 
-  return apiRequest('/api/upload/file', {
-    method: 'POST',
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest()
+    request.open('POST', buildUrl('/api/upload/file'))
+    request.responseType = 'json'
+    request.setRequestHeader('Authorization', `Bearer ${token}`)
+
+    request.upload.onprogress = (event) => {
+      if (!event.lengthComputable) {
+        return
+      }
+
+      onProgress?.(event.loaded / event.total)
+    }
+
+    request.upload.onload = () => {
+      onProgress?.(1)
+      onUploadComplete?.()
+    }
+
+    request.onload = async () => {
+      const contentType = request.getResponseHeader('content-type') ?? ''
+      const response =
+        request.response ??
+        (contentType.includes('application/json')
+          ? JSON.parse(request.responseText || 'null')
+          : request.responseText)
+
+      if (request.status >= 200 && request.status < 300) {
+        resolve(response)
+        return
+      }
+
+      const detail =
+        typeof response?.detail === 'string'
+          ? response.detail
+          : typeof response === 'string' && response
+            ? response
+            : 'Request failed. Please try again.'
+      reject(new Error(detail))
+    }
+
+    request.onerror = () => {
+      reject(new Error('Upload failed. Please try again.'))
+    }
+
+    request.send(formData)
+  })
+}
+
+export function fetchUploadProgress({ token, uploadId }) {
+  return apiRequest(`/api/upload/progress/${uploadId}`, {
     headers: {
       Authorization: `Bearer ${token}`,
     },
-    body: formData,
   })
 }
 

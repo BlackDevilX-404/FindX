@@ -6,7 +6,7 @@ import uuid
 import csv
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import chromadb
 import fitz
@@ -96,10 +96,10 @@ STOP_WORDS = {
     "with",
 }
 
-MIN_HIGH_CONFIDENT_SCORE = 0.60
-MIN_CONFIDENT_SCORE = 0.30
-MIN_LEXICAL_OVERLAP = 0.08
-MIN_LIGHT_OVERLAP = 0.04
+MIN_HIGH_CONFIDENT_SCORE = 0.72
+MIN_CONFIDENT_SCORE = 0.55
+MIN_MULTI_CHUNK_CONFIDENT_SCORE = 0.52
+MIN_SECONDARY_CHUNK_SCORE = 0.45
 FOLLOW_UP_HINTS = {
     "it",
     "its",
@@ -124,9 +124,17 @@ SMALL_TALK_PATTERNS = [
 FILE_REFERENCE_PATTERN = re.compile(r"\b[\w.-]+\.(pdf|ppt|pptx|docx|txt|md|csv|json|xlsx)\b", re.IGNORECASE)
 FILE_TYPE_HINT_PATTERN = re.compile(r"\b(pdf|ppt|pptx|docx|txt|md|csv|json|xlsx)\b", re.IGNORECASE)
 PAGE_REFERENCE_PATTERN = re.compile(r"\bpage\s*(?:#|no\.?|number)?\s*(\d{1,4})\b", re.IGNORECASE)
+AUTHOR_VIEW_PATTERN = re.compile(
+    r"^\s*what\s+(?:are|is)\s+the\s+authors?\s+mentioned\s+about\s+(.+?)\??\s*$",
+    re.IGNORECASE,
+)
+AUTHOR_IMPORTANCE_PATTERN = re.compile(
+    r"^\s*what\s+(?:are|is)\s+the\s+authors?\s+mentioned\s+about\s+(.+?)'?s\s+importance\??\s*$",
+    re.IGNORECASE,
+)
 DEFAULT_AGENT_TOP_K = 4
 MIN_AGENT_TOP_K = 2
-MAX_AGENT_TOP_K = 8
+MAX_AGENT_TOP_K = 10
 MAX_AGENT_STEPS = 3
 MAX_VERIFICATION_REFINEMENTS = 1
 TARGET_CHUNK_TOKENS = 280
@@ -159,6 +167,14 @@ class IngestResult(BaseModel):
     category: str
     sensitivity: str | None = None
     chunks_indexed: int
+
+
+@dataclass
+class IngestProgress:
+    stage: str
+    current: int
+    total: int
+    detail: str = ""
 
 
 @dataclass
@@ -227,6 +243,14 @@ class ResolvedQueryContext:
     resolved_doc_uuid: str | None
     requested_page: int | None
     top_k: int
+    system_id: str | None = None
+
+
+@dataclass
+class ReActLoopResult:
+    query_text: str
+    chunks: list[RetrievedChunk]
+    explanation: str
 
 
 def _normalize_unicode(text: str) -> str:
@@ -244,6 +268,40 @@ def _normalize_unicode(text: str) -> str:
 def normalize_text(text: str) -> str:
     normalized = _normalize_unicode(text)
     return re.sub(r"\s+", " ", normalized).strip()
+
+
+def normalize_query_intent(query_text: str) -> str:
+    normalized = normalize_text(query_text)
+    if not normalized:
+        return normalized
+
+    lowered = normalized.lower()
+    if "authors mentioned about" not in lowered:
+        return normalized
+
+    importance_match = AUTHOR_IMPORTANCE_PATTERN.match(normalized)
+    if importance_match:
+        topic = normalize_text(importance_match.group(1))
+        if topic:
+            return f"What do the authors say about the importance of {topic}?"
+
+    view_match = AUTHOR_VIEW_PATTERN.match(normalized)
+    if view_match:
+        topic = normalize_text(view_match.group(1))
+        if topic:
+            return f"What do the authors say about {topic}?"
+
+    rewritten = normalized
+    rewritten = re.sub(
+        r"\bwhat\s+(?:are|is)\s+the\s+authors?\s+mentioned\s+about\b",
+        "what do the authors say about",
+        rewritten,
+        flags=re.IGNORECASE,
+    )
+    rewritten = re.sub(r"\s+", " ", rewritten).strip()
+    if not rewritten.endswith("?"):
+        rewritten = f"{rewritten}?"
+    return rewritten
 
 
 def normalize_structured_text(text: str) -> str:
@@ -290,31 +348,6 @@ def extract_keywords(text: str) -> set[str]:
         for token in WORD_PATTERN.findall((text or "").lower())
         if token not in STOP_WORDS and len(token) > 2
     }
-
-
-def keyword_overlap(question: str, text: str) -> float:
-    question_terms = extract_keywords(question)
-    if not question_terms:
-        return 0.0
-
-    text_terms = extract_keywords(text)
-    if not text_terms:
-        return 0.0
-
-    return len(question_terms & text_terms) / len(question_terms)
-
-
-def keyword_density(question: str, text: str) -> float:
-    question_terms = extract_keywords(question)
-    if not question_terms:
-        return 0.0
-
-    text_terms = [token for token in WORD_PATTERN.findall((text or "").lower()) if len(token) > 2]
-    if not text_terms:
-        return 0.0
-
-    match_count = sum(1 for token in text_terms if token in question_terms)
-    return min((match_count / max(len(text_terms), 1)) * 14, 1.0)
 
 
 def is_heading_like(text: str) -> bool:
@@ -471,10 +504,13 @@ def build_access_where_filter(
     document_id: str | None = None,
     document_ids: list[str] | None = None,
     page: int | None = None,
+    system_id: str | None = None,
 ) -> dict[str, Any]:
     category_filter = build_category_where_filter(allowed_categories)
     visibility_filter = {"visibility_scope": {"$in": sorted({scope.lower() for scope in allowed_visibility_scopes})}}
     filters: list[dict[str, Any]] = [category_filter, visibility_filter]
+    if system_id:
+        filters.append({"system_id": {"$eq": system_id}})
     if document_ids:
         filters.append({"document_id": {"$in": sorted(set(document_ids))}})
     elif document_id:
@@ -574,6 +610,30 @@ class EnterpriseRAGService:
         query_preview = normalize_text(query_text)[:96] or "empty-query"
         print(f"[{timestamp}] [Verifier] [{stage}] [{query_preview}] {message}", flush=True)
 
+    def _log_react(self, query_text: str, stage: str, message: str) -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        query_preview = normalize_text(query_text)[:96] or "empty-query"
+        print(f"[{timestamp}] [ReAct] [{stage}] [{query_preview}] {message}", flush=True)
+
+    def _emit_react_status(
+        self,
+        query_text: str,
+        callback: Optional[Callable[[dict[str, Any]], None]],
+        status: str,
+        detail: str,
+    ) -> None:
+        normalized_status = normalize_text(status) or "Thinking"
+        normalized_detail = normalize_text(detail) or normalized_status
+        self._log_react(query_text, normalized_status.upper(), normalized_detail)
+        if callback is not None:
+            callback(
+                {
+                    "type": "status",
+                    "status": normalized_status,
+                    "detail": normalized_detail,
+                }
+            )
+
     @staticmethod
     def _coerce_bool(value: Any, default: bool = False) -> bool:
         if isinstance(value, bool):
@@ -604,6 +664,25 @@ class EnterpriseRAGService:
             document_name,
             stage,
             f"{progress_bar} {percentage:>3}% ({current}/{total} {unit_label}){suffix}",
+        )
+
+    @staticmethod
+    def _emit_ingest_progress(
+        progress_callback: Optional[Callable[[IngestProgress], None]],
+        stage: str,
+        current: int,
+        total: int,
+        detail: str = "",
+    ) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(
+            IngestProgress(
+                stage=stage,
+                current=max(int(current), 0),
+                total=max(int(total), 0),
+                detail=normalize_text(detail),
+            )
         )
 
     def save_upload(self, filename: str, file_bytes: bytes) -> Path:
@@ -706,14 +785,23 @@ class EnterpriseRAGService:
         self,
         file_path: Path,
         document_name: str | None = None,
+        progress_callback: Optional[Callable[[IngestProgress], None]] = None,
     ) -> list[dict[str, Any]]:
         extension = file_path.suffix.lower()
 
         if extension == ".pdf":
-            return self._extract_pages(file_path, document_name=document_name)
+            return self._extract_pages(
+                file_path,
+                document_name=document_name,
+                progress_callback=progress_callback,
+            )
         if extension in {".ppt", ".pptx"}:
             converted_pdf_path = self._convert_to_pdf_if_needed(file_path, document_name=document_name)
-            return self._extract_pages(converted_pdf_path, document_name=document_name)
+            return self._extract_pages(
+                converted_pdf_path,
+                document_name=document_name,
+                progress_callback=progress_callback,
+            )
         if extension == ".docx":
             return self._extract_docx_pages(file_path)
         if extension == ".xlsx":
@@ -725,7 +813,12 @@ class EnterpriseRAGService:
             "Unsupported file type. Supported formats: PDF, PPT, PPTX, DOCX, TXT, MD, CSV, JSON, XLSX."
         )
 
-    def _extract_pages(self, pdf_path: Path, document_name: str | None = None) -> list[dict[str, Any]]:
+    def _extract_pages(
+        self,
+        pdf_path: Path,
+        document_name: str | None = None,
+        progress_callback: Optional[Callable[[IngestProgress], None]] = None,
+    ) -> list[dict[str, Any]]:
         document = fitz.open(pdf_path)
         pages: list[dict[str, Any]] = []
         total_pages = len(document)
@@ -761,6 +854,13 @@ class EnterpriseRAGService:
                         "pages",
                         detail=f"{len(pages)} page(s) with extractable text",
                     )
+                self._emit_ingest_progress(
+                    progress_callback,
+                    "EXTRACT",
+                    page_number,
+                    total_pages,
+                    detail=f"{len(pages)} page(s) with extractable text",
+                )
         finally:
             document.close()
 
@@ -792,6 +892,7 @@ class EnterpriseRAGService:
         self,
         pages: list[dict[str, Any]],
         document_name: str | None = None,
+        progress_callback: Optional[Callable[[IngestProgress], None]] = None,
     ) -> list[dict[str, Any]]:
         chunks: list[dict[str, Any]] = []
         total_pages = len(pages)
@@ -816,6 +917,13 @@ class EnterpriseRAGService:
                     "pages",
                     detail=f"{len(chunks)} chunk(s) prepared",
                 )
+            self._emit_ingest_progress(
+                progress_callback,
+                "CHUNK",
+                page_index,
+                total_pages,
+                detail=f"{len(chunks)} chunk(s) prepared",
+            )
 
         return chunks
 
@@ -828,6 +936,7 @@ class EnterpriseRAGService:
         sensitivity: str | None,
         visibility_scope: str,
         uploaded_by: str,
+        system_id: str,
         chunk_batch: list[dict[str, Any]],
     ) -> int:
         texts = [chunk["text"] for chunk in chunk_batch]
@@ -856,6 +965,7 @@ class EnterpriseRAGService:
                     "window": chunk["window"],
                     "char_count": len(chunk["text"]),
                     "uploaded_by": uploaded_by,
+                    "system_id": system_id,
                 }
             )
             for chunk in chunk_batch
@@ -877,13 +987,27 @@ class EnterpriseRAGService:
         sensitivity: str | None,
         visibility_scope: str,
         uploaded_by: str,
+        system_id: str,
+        progress_callback: Optional[Callable[[IngestProgress], None]] = None,
     ) -> IngestResult:
         validated_category = validate_category(category)
         validated_visibility_scope = validate_visibility_scope(visibility_scope)
         started_at = time.perf_counter()
         self._log_ingest(document_name, "START", f"Preparing ingestion for {file_path.name}.")
-        pages = self._extract_pages_from_file(file_path, document_name=document_name)
-        chunks = self._chunk_pages(pages, document_name=document_name)
+        self._emit_ingest_progress(progress_callback, "EXTRACT", 0, 1, detail="Preparing extraction.")
+        pages = self._extract_pages_from_file(
+            file_path,
+            document_name=document_name,
+            progress_callback=progress_callback,
+        )
+        self._emit_ingest_progress(
+            progress_callback,
+            "EXTRACT",
+            max(len(pages), 1),
+            max(len(pages), 1),
+            detail=f"{len(pages)} page(s) with extractable text",
+        )
+        chunks = self._chunk_pages(pages, document_name=document_name, progress_callback=progress_callback)
 
         if not chunks:
             raise ValueError("No extractable text found in the uploaded document.")
@@ -897,6 +1021,13 @@ class EnterpriseRAGService:
             "INDEX",
             f"Encoding and storing {total_chunks} chunk(s) in {total_batches} batch(es).",
         )
+        self._emit_ingest_progress(
+            progress_callback,
+            "INDEX",
+            0,
+            total_chunks,
+            detail=f"Encoding and storing {total_chunks} chunk(s).",
+        )
 
         try:
             for batch_index, offset in enumerate(range(0, total_chunks, INGEST_WRITE_BATCH_SIZE), start=1):
@@ -909,6 +1040,7 @@ class EnterpriseRAGService:
                     sensitivity=sensitivity,
                     visibility_scope=validated_visibility_scope,
                     uploaded_by=uploaded_by,
+                    system_id=system_id,
                     chunk_batch=chunk_batch,
                 )
                 self._log_ingest_progress(
@@ -921,6 +1053,13 @@ class EnterpriseRAGService:
                         f"batch {batch_index}/{total_batches} finished in "
                         f"{format_duration(time.perf_counter() - batch_started_at)}"
                     ),
+                )
+                self._emit_ingest_progress(
+                    progress_callback,
+                    "INDEX",
+                    indexed_chunks,
+                    total_chunks,
+                    detail=f"Indexed {indexed_chunks} of {total_chunks} chunk(s).",
                 )
         except Exception:
             self._log_ingest(
@@ -939,6 +1078,13 @@ class EnterpriseRAGService:
                 f"Finished ingestion: {len(pages)} page(s), {total_chunks} chunk(s), "
                 f"{format_duration(time.perf_counter() - started_at)} total."
             ),
+        )
+        self._emit_ingest_progress(
+            progress_callback,
+            "DONE",
+            total_chunks,
+            total_chunks,
+            detail=f"Finished ingestion: {len(pages)} page(s), {total_chunks} chunk(s).",
         )
 
         return IngestResult(
@@ -1002,9 +1148,7 @@ class EnterpriseRAGService:
                 continue
 
             semantic_score = 1.0 / (1.0 + max(float(distance or 0.0), 0.0))
-            lexical_score = keyword_overlap(question, text)
-            density_score = keyword_density(question, text)
-            combined_score = round((semantic_score * 0.64) + (lexical_score * 0.24) + (density_score * 0.12), 4)
+            combined_score = round(semantic_score, 4)
             document_id = str(metadata.get("document_id") or metadata.get("doc_uuid") or "unknown")
             page = coerce_optional_int(metadata.get("page"))
             paragraph = coerce_optional_int(metadata.get("paragraph"))
@@ -1027,7 +1171,7 @@ class EnterpriseRAGService:
                     text=text,
                     score=combined_score,
                     semantic_score=semantic_score,
-                    lexical_score=lexical_score,
+                    lexical_score=0.0,
                     retrieval_query=query_text,
                 )
             )
@@ -1035,7 +1179,6 @@ class EnterpriseRAGService:
         ranked_chunks.sort(
             key=lambda item: (
                 item.score,
-                item.lexical_score,
                 item.semantic_score,
             ),
             reverse=True,
@@ -1166,9 +1309,7 @@ class EnterpriseRAGService:
         if not combined_text:
             return []
 
-        overlap_score = keyword_overlap(query_text, combined_text)
-        density_score = keyword_density(query_text, combined_text)
-        exact_page_score = max(0.99, round((overlap_score * 0.5) + (density_score * 0.5), 4))
+        exact_page_score = 0.99
 
         return [
             RetrievedChunk(
@@ -1183,7 +1324,7 @@ class EnterpriseRAGService:
                 text=combined_text,
                 score=exact_page_score,
                 semantic_score=exact_page_score,
-                lexical_score=max(overlap_score, 0.5),
+                lexical_score=0.0,
                 retrieval_query=query_text,
             )
         ]
@@ -1231,25 +1372,15 @@ class EnterpriseRAGService:
         if not expanded_text:
             return chunk
 
-        expanded_overlap = keyword_overlap(question, expanded_text)
         if len(expanded_text) <= len(chunk.text):
             return chunk
 
-        if (
-            expanded_overlap >= chunk.lexical_score
-            or len(chunk.text) < 180
-            or is_heading_like(chunk.text)
-        ):
-            density_score = keyword_density(question, expanded_text)
-            updated_score = round(
-                (chunk.semantic_score * 0.64) + (expanded_overlap * 0.24) + (density_score * 0.12),
-                4,
-            )
+        if len(chunk.text) < 180 or is_heading_like(chunk.text):
             return replace(
                 chunk,
                 text=expanded_text,
-                lexical_score=expanded_overlap,
-                score=updated_score,
+                lexical_score=0.0,
+                score=round(chunk.semantic_score, 4),
             )
 
         return chunk
@@ -1298,20 +1429,33 @@ class EnterpriseRAGService:
         created_at = str(record.get("created_at") or "")
         return updated_at, created_at
 
-    def _get_active_document_records(self, role: str) -> list[dict[str, Any]]:
+    def _get_active_document_records(self, role: str, system_id: str | None = None) -> list[dict[str, Any]]:
         allowed_categories = allowed_categories_for_role(role)
         allowed_visibility_scopes = allowed_visibility_scopes_for_role(role)
         records: list[dict[str, Any]] = []
+        rejected_visibility: list[str] = []
 
-        for record in list_document_records():
+        for record in list_document_records(system_id=system_id):
             document_id = str(record.get("document_id") or "").strip()
             if not document_id:
                 continue
             if not category_matches_allowed(record.get("category"), allowed_categories):
                 continue
-            if not visibility_matches_allowed(record.get("visibility_scope"), allowed_visibility_scopes):
+            
+            # Check visibility and log rejections
+            record_visibility = record.get("visibility_scope", "private")
+            if not visibility_matches_allowed(record_visibility, allowed_visibility_scopes):
+                rejected_visibility.append(f"{document_id}(visibility:{record_visibility})")
                 continue
+            
             records.append(record)
+        
+        # Log visibility filtering for debugging
+        if rejected_visibility and len(rejected_visibility) <= 10:
+            print(
+                f"[Visibility Filter] Role '{role}' filtered out: {', '.join(rejected_visibility[:5])}{'...' if len(rejected_visibility) > 5 else ''}",
+                flush=True,
+            )
 
         return records
 
@@ -1320,8 +1464,9 @@ class EnterpriseRAGService:
         query_text: str,
         role: str,
         requested_document_id: str | None = None,
+        system_id: str | None = None,
     ) -> str | None:
-        active_records = self._get_active_document_records(role)
+        active_records = self._get_active_document_records(role, system_id=system_id)
         active_ids = {
             str(record.get("document_id") or "").strip()
             for record in active_records
@@ -1407,6 +1552,38 @@ class EnterpriseRAGService:
         resolved_id = str(matches[0].get("document_id") or "").strip()
         return resolved_id or None
 
+    def _resolve_document_id_from_history(
+        self,
+        chat_history: list[dict[str, str]],
+        role: str,
+        system_id: str | None = None,
+    ) -> str | None:
+        for message in reversed(chat_history):
+            if message.get("role") != "user":
+                continue
+
+            content = normalize_text(message.get("content") or "")
+            if not content:
+                continue
+
+            if not (
+                content.lower().startswith(("document:", "doc:", "file:"))
+                or FILE_REFERENCE_PATTERN.search(content)
+                or FILE_TYPE_HINT_PATTERN.search(content)
+            ):
+                continue
+
+            resolved_id = self._resolve_fixed_document_id(
+                query_text=content,
+                role=role,
+                requested_document_id=None,
+                system_id=system_id,
+            )
+            if resolved_id:
+                return resolved_id
+
+        return None
+
     @staticmethod
     def _query_mentions_specific_document(query_text: str) -> bool:
         return bool(FILE_REFERENCE_PATTERN.search(query_text or ""))
@@ -1470,6 +1647,97 @@ class EnterpriseRAGService:
         return keyword_query or query_text
 
     @staticmethod
+    def _is_synthesis_query(query_text: str) -> bool:
+        lowered = normalize_text(query_text).lower()
+        synthesis_markers = (
+            "compare",
+            "comparison",
+            "summarize",
+            "summary",
+            "overall",
+            "across",
+            "combine",
+            "synthesize",
+            "theme",
+            "themes",
+            "drivers",
+            "risks",
+            "opportunities",
+            "change",
+            "changes",
+            "growth",
+            "performance",
+            "why",
+            "how did",
+            "how does",
+            "what are the key",
+        )
+        return any(marker in lowered for marker in synthesis_markers) or len(lowered.split()) >= 12
+
+    def _target_answer_top_k(self, query_text: str, fallback: int) -> int:
+        base_top_k = clamp_top_k(fallback, DEFAULT_AGENT_TOP_K)
+        if self._is_synthesis_query(query_text):
+            return clamp_top_k(max(base_top_k, 8), base_top_k)
+        return base_top_k
+
+    def _has_synthesis_coverage(self, query_text: str, chunks: list[RetrievedChunk]) -> bool:
+        if not self._is_synthesis_query(query_text):
+            return True
+        if len(chunks) < 4:
+            return False
+
+        unique_docs = {chunk.document_id for chunk in chunks if chunk.document_id}
+        unique_pages = {
+            (chunk.document_id, chunk.page)
+            for chunk in chunks
+            if chunk.document_id and chunk.page is not None
+        }
+
+        if len(unique_docs) >= 2:
+            return True
+        return len(unique_pages) >= 3
+
+    def _generate_sub_queries(self, query_text: str) -> list[str]:
+        if not self._is_synthesis_query(query_text):
+            return []
+
+        try:
+            response = self.llm.invoke(
+                [
+                    SystemMessage(
+                        content=(
+                            "Break a complex enterprise document question into 2 to 4 short retrieval queries. "
+                            "Each query should target one facet needed to synthesize the final answer. "
+                            "Return one query per line with no numbering and no commentary."
+                        )
+                    ),
+                    HumanMessage(content=query_text),
+                ]
+            )
+            raw_text = self._read_llm_text(response.content)
+        except Exception:
+            return []
+
+        candidates: list[str] = []
+        for line in raw_text.splitlines():
+            normalized = normalize_text(re.sub(r"^[\-\d\.\)\s]+", "", line))
+            if normalized and normalized.lower() != normalize_text(query_text).lower():
+                candidates.append(normalized)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            lowered = item.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            deduped.append(item)
+            if len(deduped) >= 4:
+                break
+
+        return deduped
+
+    @staticmethod
     def _read_llm_text(content: Any) -> str:
         if isinstance(content, str):
             return content
@@ -1488,12 +1756,17 @@ class EnterpriseRAGService:
         query_text: str,
         chat_history: list[dict[str, str]],
     ) -> list[PlannedQuery]:
-        planned_queries = [PlannedQuery(text=normalize_text(query_text), reason="original user question")]
+        normalized_query = normalize_query_intent(query_text)
+        planned_queries = [PlannedQuery(text=normalized_query, reason="original user question")]
 
         if chat_history and self._looks_like_follow_up(query_text):
             rewritten = self._rewrite_query_with_history(query_text, chat_history)
             if rewritten and rewritten.lower() != planned_queries[0].text.lower():
                 planned_queries.append(PlannedQuery(text=rewritten, reason="rewritten follow-up with conversation context"))
+
+        for sub_query in self._generate_sub_queries(planned_queries[0].text):
+            if all(sub_query.lower() != item.text.lower() for item in planned_queries):
+                planned_queries.append(PlannedQuery(text=sub_query, reason="facet-specific synthesis retrieval"))
 
         keyword_query = self._generate_keyword_query(planned_queries[0].text)
         if keyword_query and all(keyword_query.lower() != item.text.lower() for item in planned_queries):
@@ -1506,11 +1779,14 @@ class EnterpriseRAGService:
         base_top_k = clamp_top_k(fallback, DEFAULT_AGENT_TOP_K)
         lowered = query_text.lower()
 
+        if EnterpriseRAGService._is_synthesis_query(query_text):
+            return clamp_top_k(max(base_top_k, 8), base_top_k)
+
         if any(
             marker in lowered
             for marker in ("compare", "difference", "different", "list", "all", "summary", "summarize", "steps")
         ):
-            return clamp_top_k(max(base_top_k, 6), base_top_k)
+            return clamp_top_k(max(base_top_k, 8), base_top_k)
 
         if len(query_text.split()) <= 6:
             return clamp_top_k(max(MIN_AGENT_TOP_K, base_top_k - 1), base_top_k)
@@ -1616,7 +1892,7 @@ class EnterpriseRAGService:
         fixed_document_id: str | None,
         default_top_k: int,
     ) -> RetrievalAction:
-        default_query = normalize_text(query_text) or query_text
+        default_query = normalize_query_intent(query_text) or query_text
         observation_block = "\n\n".join(observations[-2:]) if observations else "No retrieval observations yet."
 
         try:
@@ -1627,9 +1903,10 @@ class EnterpriseRAGService:
                             "You control retrieval for an enterprise RAG system. "
                             "Pick one next action and return JSON only. "
                             "Allowed actions: "
-                            "search = call the retrieval tool with a focused query and a top_k between 2 and 8; "
+                            f"search = call the retrieval tool with a focused query and a top_k between {MIN_AGENT_TOP_K} and {MAX_AGENT_TOP_K}; "
                             "finish = stop retrieving because the evidence is already sufficient. "
                             "Use lower top_k for narrow factual lookups, medium top_k for policy questions, and higher top_k for comparisons, lists, or ambiguous questions. "
+                            "For synthesis questions, gather evidence from multiple sections or pages before choosing finish. "
                             "If one document clearly dominates, use its exact document_id to focus the next search. "
                             "Never invent a document_id. "
                             'Return JSON with keys: action, query, top_k, document_id, reason.'
@@ -1707,17 +1984,34 @@ class EnterpriseRAGService:
         document_id: str | None = None,
         fetch_k: int | None = None,
         max_per_document: int | None = None,
+        system_id: str | None = None,
     ) -> list[RetrievedChunk]:
-        active_records = self._get_active_document_records(role)
+        allowed_categories = allowed_categories_for_role(role)
+        allowed_visibility_scopes = allowed_visibility_scopes_for_role(role)
+        
+        # CRITICAL: Always get active documents from MongoDB (includes visibility filtering)
+        active_records = self._get_active_document_records(role, system_id=system_id)
         active_document_ids = {
             str(record.get("document_id") or "").strip()
             for record in active_records
             if str(record.get("document_id") or "").strip()
         }
+        
+        # Defensive logging for visibility filtering
         if not active_document_ids:
+            print(
+                f"[Query] Role '{role}' has no accessible documents. "
+                f"Allowed categories: {allowed_categories}, allowed visibility: {allowed_visibility_scopes}",
+                flush=True,
+            )
             return []
 
         if document_id and document_id not in active_document_ids:
+            print(
+                f"[Query] Document {document_id} not accessible for role '{role}'. "
+                f"Accessible documents: {sorted(active_document_ids)[:5]}{'...' if len(active_document_ids) > 5 else ''}",
+                flush=True,
+            )
             return []
 
         requested_top_k = clamp_top_k(top_k, DEFAULT_AGENT_TOP_K)
@@ -1728,41 +2022,81 @@ class EnterpriseRAGService:
         ).tolist()
 
         effective_fetch_k = fetch_k or max(requested_top_k * 6, 24)
-        filtered_results = self.collection.query(
+        
+        # FIXED: Do NOT rely on Chroma's WHERE clause (it may not support $in properly)
+        # Instead, query Chroma without WHERE clause and filter results locally
+        # This ensures visibility is ALWAYS enforced regardless of Chroma's WHERE support
+        print(
+            f"[Query] Role '{role}' requesting {requested_top_k} results from {len(active_document_ids)} accessible documents",
+            flush=True,
+        )
+        
+        raw_results = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=effective_fetch_k,
-            where=build_access_where_filter(
-                allowed_categories_for_role(role),
-                allowed_visibility_scopes_for_role(role),
-                document_id=document_id,
-                document_ids=sorted(active_document_ids) if not document_id else None,
-            ),
             include=["documents", "metadatas", "distances"],
         )
-        ranked_chunks = self._rank_chunks(query_text, filtered_results, query_text=query_text)
+        
+        # Apply visible access filtering locally (this is the enforcement point)
+        locally_filtered = self._filter_results_by_access(
+            raw_results,
+            allowed_categories=allowed_categories,
+            allowed_visibility_scopes=allowed_visibility_scopes,
+            document_id=document_id,
+            active_document_ids=active_document_ids,
+        )
+        
+        ranked_chunks = self._rank_chunks(query_text, locally_filtered, query_text=query_text)
+        
         if ranked_chunks:
+            print(
+                f"[Query] Role '{role}' found {len(ranked_chunks)} accessible chunk(s)",
+                flush=True,
+            )
             return self._select_top_chunks(
                 ranked_chunks,
                 top_k=requested_top_k,
                 max_per_document=max_per_document,
             )
-
+        
+        # If initial results have no accessible chunks, try broader search
         if self.collection.count() == 0:
+            print(f"[Query] Collection is empty", flush=True)
             return []
 
-        compatibility_results = self.collection.query(
+        print(
+            f"[Query] Initial search found no accessible results for role '{role}', trying alternative retrieval...",
+            flush=True,
+        )
+        
+        # Fallback: fetch more results and filter them
+        fallback_results = self.collection.query(
             query_embeddings=[query_embedding],
-            n_results=effective_fetch_k,
+            n_results=effective_fetch_k * 2,  # Fetch more for fallback
             include=["documents", "metadatas", "distances"],
         )
-        locally_filtered = self._filter_results_by_access(
-            compatibility_results,
-            allowed_categories=allowed_categories_for_role(role),
-            allowed_visibility_scopes=allowed_visibility_scopes_for_role(role),
+        
+        fallback_filtered = self._filter_results_by_access(
+            fallback_results,
+            allowed_categories=allowed_categories,
+            allowed_visibility_scopes=allowed_visibility_scopes,
             document_id=document_id,
             active_document_ids=active_document_ids,
         )
-        ranked_chunks = self._rank_chunks(query_text, locally_filtered, query_text=query_text)
+        
+        ranked_chunks = self._rank_chunks(query_text, fallback_filtered, query_text=query_text)
+        
+        if ranked_chunks:
+            print(
+                f"[Query] Fallback search found {len(ranked_chunks)} accessible chunk(s) for role '{role}'",
+                flush=True,
+            )
+        else:
+            print(
+                f"[Query] No accessible results found for role '{role}' after fallback",
+                flush=True,
+            )
+        
         return self._select_top_chunks(
             ranked_chunks,
             top_k=requested_top_k,
@@ -1791,12 +2125,28 @@ class EnterpriseRAGService:
             for metadata in metadatas
         ]
         max_batch_size = self._get_chroma_batch_size()
-        for id_batch, metadata_batch in zip(
-            self._iter_batches(ids, max_batch_size),
-            self._iter_batches(next_metadatas, max_batch_size),
-        ):
-            self.collection.update(ids=id_batch, metadatas=metadata_batch)
-        return True
+        try:
+            for id_batch, metadata_batch in zip(
+                self._iter_batches(ids, max_batch_size),
+                self._iter_batches(next_metadatas, max_batch_size),
+            ):
+                self.collection.update(ids=id_batch, metadatas=metadata_batch)
+            
+            # Clear the document chunk cache to ensure fresh data is loaded
+            self._document_chunk_cache.pop(document_id, None)
+            
+            print(
+                f"[Visibility Update] Document {document_id} visibility updated to '{validated_visibility_scope}' "
+                f"({len(ids)} chunks updated)",
+                flush=True,
+            )
+            return True
+        except Exception as e:
+            print(
+                f"[Visibility Update ERROR] Failed to update visibility for document {document_id}: {e}",
+                flush=True,
+            )
+            return False
 
     def delete_document(self, document_id: str) -> bool:
         results = self.collection.get(
@@ -1843,12 +2193,17 @@ class EnterpriseRAGService:
                 text=normalize_text(chunk.text),
                 score=chunk.score,
                 semantic_score=chunk.score,
-                lexical_score=keyword_overlap(query_text, chunk.text),
+                lexical_score=0.0,
                 retrieval_query=query_text,
             )
             for chunk in legacy_chunks
             if normalize_text(chunk.text)
         ]
+
+    @staticmethod
+    def _can_use_legacy_fallback(role: str) -> bool:
+        normalized_role = normalize_role(role)
+        return normalized_role == ROLE_ADMIN
 
     @staticmethod
     def _merge_ranked_chunks(question: str, chunk_groups: list[list[RetrievedChunk]], top_k: int) -> list[RetrievedChunk]:
@@ -1867,7 +2222,7 @@ class EnterpriseRAGService:
                 if fingerprint in seen:
                     continue
                 seen.add(fingerprint)
-                rescored = round((chunk.score * 0.82) + (keyword_overlap(question, chunk.text) * 0.18), 4)
+                rescored = round(chunk.semantic_score, 4)
                 scored.append(replace(chunk, score=rescored))
 
         scored.sort(key=lambda item: item.score, reverse=True)
@@ -1883,16 +2238,11 @@ class EnterpriseRAGService:
 
         for chunk in chunks:
             expanded_chunk = chunk if chunk.category == "LEGACY" else self._expand_chunk_context(question, chunk)
-            overlap_score = keyword_overlap(question, expanded_chunk.text)
-            density_score = keyword_density(question, expanded_chunk.text)
-            updated_score = round(
-                (expanded_chunk.semantic_score * 0.60) + (overlap_score * 0.26) + (density_score * 0.14),
-                4,
-            )
+            updated_score = round(expanded_chunk.semantic_score, 4)
             rescored.append(
                 replace(
                     expanded_chunk,
-                    lexical_score=overlap_score,
+                    lexical_score=0.0,
                     score=updated_score,
                 )
             )
@@ -1900,7 +2250,6 @@ class EnterpriseRAGService:
         rescored.sort(
             key=lambda item: (
                 item.score,
-                item.lexical_score,
                 item.semantic_score,
             ),
             reverse=True,
@@ -1914,6 +2263,7 @@ class EnterpriseRAGService:
         chat_history: list[dict[str, str]],
         doc_uuid: str | None,
         top_k: int,
+        system_id: str | None = None,
     ) -> list[RetrievedChunk]:
         desired_top_k = self._heuristic_top_k(query_text, top_k)
         observations: list[str] = []
@@ -1942,6 +2292,7 @@ class EnterpriseRAGService:
                 document_id=scoped_document_id,
                 fetch_k=max(desired_top_k * 6, 24),
                 max_per_document=max_per_document,
+                system_id=system_id,
             )
             observations.append(
                 self._build_retrieval_observation(
@@ -1981,6 +2332,7 @@ class EnterpriseRAGService:
                 document_id=doc_uuid,
                 fetch_k=max(desired_top_k * 6, 24),
                 max_per_document=None if doc_uuid else max(2, min(3, desired_top_k // 2 + 1)),
+                system_id=system_id,
             )
             if chunks:
                 fallback_groups.append(chunks)
@@ -2000,22 +2352,20 @@ class EnterpriseRAGService:
             return False
 
         top_chunk = chunks[0]
-        top_overlap = keyword_overlap(question, top_chunk.text)
 
         if top_chunk.score >= MIN_HIGH_CONFIDENT_SCORE:
             return True
 
-        if top_overlap >= MIN_LEXICAL_OVERLAP:
-            return True
-
-        if top_chunk.score >= MIN_CONFIDENT_SCORE and top_overlap >= MIN_LIGHT_OVERLAP:
+        if top_chunk.score >= MIN_CONFIDENT_SCORE:
             return True
 
         if len(chunks) >= 2:
-            second_overlap = keyword_overlap(question, chunks[1].text)
-            average_score = (top_chunk.score + chunks[1].score) / 2
-            max_overlap = max(top_overlap, second_overlap)
-            if average_score >= MIN_CONFIDENT_SCORE and max_overlap >= MIN_LIGHT_OVERLAP:
+            second_chunk = chunks[1]
+            average_score = (top_chunk.score + second_chunk.score) / 2
+            if (
+                average_score >= MIN_MULTI_CHUNK_CONFIDENT_SCORE
+                and second_chunk.score >= MIN_SECONDARY_CHUNK_SCORE
+            ):
                 return True
 
         return False
@@ -2038,18 +2388,22 @@ class EnterpriseRAGService:
 
     def _build_answer_messages(self, query_text: str, chunks: list[RetrievedChunk]) -> list[Any]:
         context = self._build_context(chunks)
+        interpreted_query = normalize_query_intent(query_text) or query_text
         return [
             SystemMessage(
                 content=(
                     "You are an enterprise RAG assistant. "
                     "Answer strictly from the retrieved context. "
+                    "Synthesize evidence across multiple retrieved passages and pages when needed. "
+                    "If the answer requires combining details from separate sections, explicitly glue those supported details together into one coherent answer. "
+                    "When summarizing corporate goals or achievements, include the specific quantitative metrics, dates, and baseline years mentioned in the retrieved text. "
                     "If the context is insufficient, say so clearly. "
                     "Do not invent policy details."
                 )
             ),
             HumanMessage(
                 content=(
-                    f"User question:\n{query_text}\n\n"
+                    f"User question:\n{interpreted_query}\n\n"
                     f"Authorized retrieved context:\n{context}\n\n"
                     "Write a concise answer grounded only in that context."
                 )
@@ -2189,12 +2543,15 @@ class EnterpriseRAGService:
         scope_label = context.resolved_doc_uuid or "all accessible documents"
         exact_page_label = str(context.requested_page) if context.requested_page is not None else "none"
         authorized_context = self._build_context(attempt.chunks)
+        interpreted_query = normalize_query_intent(context.query_text) or context.query_text
 
         return [
             SystemMessage(
                 content=(
                     "You are a grounding verifier for an enterprise RAG system. "
                     "Check whether the draft answer is fully supported by the authorized context only. "
+                    "Interpret awkward wording by intent. "
+                    "When a user asks what authors mentioned or say about a topic in a paper, treat that as asking for the paper's stated view, not for a list of author names, unless the question explicitly asks who the authors are. "
                     "Return JSON only with keys: grounded, needs_more_retrieval, gap_query, reason, keep_document_scope. "
                     "Set grounded=true only when all material claims in the draft answer are supported by the authorized context. "
                     "Set needs_more_retrieval=true only when one more focused retrieval pass is likely to fix the evidence gap. "
@@ -2207,6 +2564,7 @@ class EnterpriseRAGService:
             HumanMessage(
                 content=(
                     f"User question:\n{context.query_text}\n\n"
+                    f"Interpreted question:\n{interpreted_query}\n\n"
                     f"Resolved document scope:\n{scope_label}\n\n"
                     f"Exact page requested:\n{exact_page_label}\n\n"
                     f"Current refinement round:\n{attempt.refinement_count}\n\n"
@@ -2317,7 +2675,9 @@ class EnterpriseRAGService:
         doc_uuid: str | None,
         chat_history: list[dict[str, Any]] | None,
         top_k: int,
+        system_id: str | None = None,
     ) -> tuple[ResolvedQueryContext | None, QueryResult | None]:
+        query_text = normalize_query_intent(query_text) or query_text
         normalized_role = normalize_role(role)
         allowed_categories = allowed_categories_for_role(normalized_role)
         allowed_visibility_scopes = allowed_visibility_scopes_for_role(normalized_role)
@@ -2336,7 +2696,14 @@ class EnterpriseRAGService:
             query_text=query_text,
             role=normalized_role,
             requested_document_id=doc_uuid,
+            system_id=system_id,
         )
+        if not resolved_doc_uuid and not doc_uuid:
+            resolved_doc_uuid = self._resolve_document_id_from_history(
+                chat_history=normalized_history,
+                role=normalized_role,
+                system_id=system_id,
+            )
         if (doc_uuid and not resolved_doc_uuid) or (
             not doc_uuid and self._query_mentions_specific_document(query_text) and not resolved_doc_uuid
         ):
@@ -2354,6 +2721,7 @@ class EnterpriseRAGService:
             resolved_doc_uuid=resolved_doc_uuid,
             requested_page=self._extract_requested_page(query_text),
             top_k=top_k,
+            system_id=system_id,
         ), None
 
     def _retrieve_accessible_chunks(
@@ -2368,10 +2736,17 @@ class EnterpriseRAGService:
             chat_history=context.normalized_history,
             doc_uuid=document_scope,
             top_k=context.top_k,
+            system_id=context.system_id,
         )
 
         if selected_chunks:
             return selected_chunks
+
+        # Legacy workspace collections do not carry the role-based visibility
+        # metadata used by the enterprise index. Restrict this fallback to
+        # admins so HR-only or developer-only files cannot leak across roles.
+        if not self._can_use_legacy_fallback(context.role):
+            return []
 
         planned_queries = self._plan_queries(query_text, context.normalized_history)
         legacy_candidates: list[list[RetrievedChunk]] = []
@@ -2455,6 +2830,279 @@ class EnterpriseRAGService:
         if early_result is not None or context is None:
             return [], early_result
         return self._resolve_query_chunks(context)
+
+    def _build_react_status_event(self, query_text: str, status: str, detail: str) -> dict[str, Any]:
+        event: list[dict[str, Any]] = []
+        self._emit_react_status(query_text, event.append, status, detail)
+        return event[0]
+
+    def _iter_react_loop(self, context: ResolvedQueryContext):
+        synthesis_mode = self._is_synthesis_query(context.query_text)
+        if context.requested_page is not None and context.resolved_doc_uuid:
+            yield self._build_react_status_event(
+                context.query_text,
+                "Retrieving",
+                f"Fetching authorized content from page {context.requested_page}.",
+            )
+            exact_page_chunks = self._fetch_exact_page_chunks(
+                query_text=context.query_text,
+                role=context.role,
+                document_id=context.resolved_doc_uuid,
+                page_number=context.requested_page,
+            )
+            if exact_page_chunks:
+                yield {
+                    "type": "react_result",
+                    "query_text": context.query_text,
+                    "chunks": exact_page_chunks,
+                    "explanation": self._build_explanation(exact_page_chunks),
+                }
+                return
+
+            document_label = self._get_document_label(context.resolved_doc_uuid)
+            yield {
+                "type": "react_error",
+                "answer": f"No extractable content was found on page {context.requested_page} of {document_label}.",
+                "explanation": (
+                    "The request targeted an exact page in a specific accessible document, "
+                    "but that page is not indexed or has no extractable text."
+                ),
+                "sources": [],
+            }
+            return
+
+        desired_top_k = self._heuristic_top_k(context.query_text, context.top_k)
+        answer_top_k = self._target_answer_top_k(context.query_text, desired_top_k)
+        observations: list[str] = []
+        candidate_groups: list[list[RetrievedChunk]] = []
+
+        yield self._build_react_status_event(
+            context.query_text,
+            "Thinking",
+            "Understanding the request and planning the fastest authorized search path.",
+        )
+
+        for step in range(1, MAX_AGENT_STEPS + 1):
+            action = self._plan_retrieval_action(
+                query_text=context.query_text,
+                chat_history=context.normalized_history,
+                observations=observations,
+                step=step,
+                fixed_document_id=context.resolved_doc_uuid,
+                default_top_k=desired_top_k,
+            )
+            desired_top_k = clamp_top_k(action.top_k, desired_top_k)
+            answer_top_k = self._target_answer_top_k(context.query_text, desired_top_k)
+
+            if action.action == "finish" and candidate_groups:
+                merged_chunks = self._merge_ranked_chunks(
+                    question=context.query_text,
+                    chunk_groups=candidate_groups,
+                    top_k=answer_top_k,
+                )
+                if synthesis_mode and not self._has_synthesis_coverage(context.query_text, merged_chunks):
+                    yield self._build_react_status_event(
+                        context.query_text,
+                        "Thinking",
+                        "The agent has partial evidence and is gathering supporting details from more sections.",
+                    )
+                    continue
+
+                yield self._build_react_status_event(
+                    context.query_text,
+                    "Reviewing",
+                    "Reviewing the strongest authorized evidence before answering.",
+                )
+                final_chunks = self._finalize_selected_chunks(
+                    context.query_text,
+                    merged_chunks,
+                    top_k=answer_top_k,
+                )
+                if final_chunks:
+                    yield {
+                        "type": "react_result",
+                        "query_text": context.query_text,
+                        "chunks": final_chunks,
+                        "explanation": self._build_explanation(final_chunks),
+                    }
+                    return
+                break
+
+            search_query = action.query or context.query_text
+            scoped_document_id = context.resolved_doc_uuid or action.document_id
+            max_per_document = None if scoped_document_id or synthesis_mode else max(2, min(3, desired_top_k // 2 + 1))
+
+            yield self._build_react_status_event(
+                context.query_text,
+                "Retrieving",
+                f'Searching authorized files for "{search_query}".',
+            )
+
+            chunks = self._query_enterprise_chunks(
+                query_text=search_query,
+                role=context.role,
+                top_k=desired_top_k,
+                document_id=scoped_document_id,
+                fetch_k=max(desired_top_k * 6, 24),
+                max_per_document=max_per_document,
+                system_id=context.system_id,
+            )
+            observations.append(
+                self._build_retrieval_observation(
+                    query_text=search_query,
+                    document_id=scoped_document_id,
+                    chunks=chunks,
+                )
+            )
+
+            if not chunks:
+                yield self._build_react_status_event(
+                    context.query_text,
+                    "Thinking",
+                    "Adjusting the search to find stronger evidence.",
+                )
+                continue
+
+            candidate_groups.append(chunks)
+            merged_chunks = self._merge_ranked_chunks(
+                question=context.query_text,
+                chunk_groups=candidate_groups,
+                top_k=answer_top_k,
+            )
+            unique_documents = sorted({chunk.document for chunk in merged_chunks})
+            yield self._build_react_status_event(
+                context.query_text,
+                "Reviewing",
+                f"Reviewing evidence from {len(unique_documents)} authorized file(s).",
+            )
+
+            if self._is_confident_enough(context.query_text, merged_chunks):
+                if synthesis_mode and not self._has_synthesis_coverage(context.query_text, merged_chunks):
+                    yield self._build_react_status_event(
+                        context.query_text,
+                        "Thinking",
+                        "The agent found relevant evidence but is gathering more pages to synthesize a complete answer.",
+                    )
+                    continue
+                final_chunks = self._finalize_selected_chunks(
+                    context.query_text,
+                    merged_chunks,
+                    top_k=answer_top_k,
+                )
+                yield {
+                    "type": "react_result",
+                    "query_text": context.query_text,
+                    "chunks": final_chunks,
+                    "explanation": self._build_explanation(final_chunks),
+                }
+                return
+
+        if candidate_groups:
+            merged_chunks = self._merge_ranked_chunks(
+                question=context.query_text,
+                chunk_groups=candidate_groups,
+                top_k=answer_top_k,
+            )
+            final_chunks = self._finalize_selected_chunks(
+                context.query_text,
+                merged_chunks,
+                top_k=answer_top_k,
+            )
+            if final_chunks:
+                yield {
+                    "type": "react_result",
+                    "query_text": context.query_text,
+                    "chunks": final_chunks,
+                    "explanation": self._build_explanation(final_chunks),
+                }
+                return
+
+        planned_queries = self._plan_queries(context.query_text, context.normalized_history)
+        fallback_groups: list[list[RetrievedChunk]] = []
+        for planned_query in planned_queries:
+            yield self._build_react_status_event(
+                context.query_text,
+                "Thinking",
+                f'Trying a more focused search for "{planned_query.text}".',
+            )
+            chunks = self._query_enterprise_chunks(
+                query_text=planned_query.text,
+                role=context.role,
+                top_k=desired_top_k,
+                document_id=context.resolved_doc_uuid,
+                fetch_k=max(desired_top_k * 6, 24),
+                max_per_document=None if context.resolved_doc_uuid or synthesis_mode else max(2, min(3, desired_top_k // 2 + 1)),
+                system_id=context.system_id,
+            )
+            if chunks:
+                fallback_groups.append(chunks)
+
+        if fallback_groups:
+            merged_chunks = self._merge_ranked_chunks(
+                question=context.query_text,
+                chunk_groups=fallback_groups,
+                top_k=answer_top_k,
+            )
+            final_chunks = self._finalize_selected_chunks(
+                context.query_text,
+                merged_chunks,
+                top_k=answer_top_k,
+            )
+            if final_chunks:
+                yield {
+                    "type": "react_result",
+                    "query_text": context.query_text,
+                    "chunks": final_chunks,
+                    "explanation": self._build_explanation(final_chunks),
+                }
+                return
+
+        if context.chat_id and self._can_use_legacy_fallback(context.role):
+            yield self._build_react_status_event(
+                context.query_text,
+                "Retrieving",
+                "Enterprise index was weak for this query. Checking the legacy workspace store.",
+            )
+            legacy_candidates: list[list[RetrievedChunk]] = []
+            for planned_query in planned_queries:
+                legacy_chunks = self._query_legacy_chunks(
+                    query_text=planned_query.text,
+                    chat_id=context.chat_id,
+                    doc_uuid=context.resolved_doc_uuid,
+                    top_k=desired_top_k,
+                )
+                if legacy_chunks:
+                    legacy_candidates.append(legacy_chunks)
+
+            if legacy_candidates:
+                merged_chunks = self._merge_ranked_chunks(
+                    question=context.query_text,
+                    chunk_groups=legacy_candidates,
+                    top_k=answer_top_k,
+                )
+                final_chunks = self._finalize_selected_chunks(
+                    context.query_text,
+                    merged_chunks,
+                    top_k=answer_top_k,
+                )
+                if final_chunks:
+                    yield {
+                        "type": "react_result",
+                        "query_text": context.query_text,
+                        "chunks": final_chunks,
+                        "explanation": self._build_explanation(final_chunks),
+                    }
+                    return
+
+        yield {
+            "type": "react_error",
+            "answer": "No accessible data found for your role",
+            "explanation": (
+                "The agent searched the files you are allowed to access, tried focused retrieval refinements, "
+                "and still did not find strong enough evidence for this question."
+            ),
+            "sources": [],
+        }
 
     def _run_verified_query(
         self,
@@ -2553,6 +3201,7 @@ class EnterpriseRAGService:
         doc_uuid: str | None = None,
         chat_history: list[dict[str, Any]] | None = None,
         top_k: int = 4,
+        system_id: str | None = None,
     ) -> QueryResult:
         context, early_result = self._prepare_query_context(
             query_text=query_text,
@@ -2561,6 +3210,7 @@ class EnterpriseRAGService:
             doc_uuid=doc_uuid,
             chat_history=chat_history,
             top_k=top_k,
+            system_id=system_id,
         )
         if early_result is not None:
             return early_result
@@ -2569,11 +3219,39 @@ class EnterpriseRAGService:
                 "The request could not be prepared for verified retrieval."
             )
 
-        selected_chunks, chunk_error = self._resolve_query_chunks(context)
-        if chunk_error is not None:
-            return chunk_error
+        react_result: ReActLoopResult | None = None
+        react_error: QueryResult | None = None
 
-        return self._run_verified_query(context, selected_chunks)
+        for event in self._iter_react_loop(context):
+            if event["type"] == "react_result":
+                react_result = ReActLoopResult(
+                    query_text=event["query_text"],
+                    chunks=event["chunks"],
+                    explanation=event["explanation"],
+                )
+                break
+            if event["type"] == "react_error":
+                react_error = QueryResult(
+                    answer=event["answer"],
+                    explanation=event["explanation"],
+                    sources=[],
+                )
+                break
+
+        if react_error is not None:
+            return react_error
+        if react_result is None:
+            return QueryResult(
+                answer="No accessible data found for your role",
+                explanation="The ReAct loop did not produce a final grounded result.",
+                sources=[],
+            )
+
+        return QueryResult(
+            answer=self._generate_answer(react_result.query_text, react_result.chunks),
+            explanation=react_result.explanation,
+            sources=self._build_sources(react_result.chunks),
+        )
 
     def stream_query(
         self,
@@ -2583,6 +3261,7 @@ class EnterpriseRAGService:
         doc_uuid: str | None = None,
         chat_history: list[dict[str, Any]] | None = None,
         top_k: int = 4,
+        system_id: str | None = None,
     ):
         context, early_result = self._prepare_query_context(
             query_text=query_text,
@@ -2591,6 +3270,7 @@ class EnterpriseRAGService:
             doc_uuid=doc_uuid,
             chat_history=chat_history,
             top_k=top_k,
+            system_id=system_id,
         )
 
         if early_result is not None:
@@ -2614,24 +3294,51 @@ class EnterpriseRAGService:
             }
             return
 
-        selected_chunks, chunk_error = self._resolve_query_chunks(context)
-        if chunk_error is not None:
+        react_result: ReActLoopResult | None = None
+
+        for event in self._iter_react_loop(context):
+            if event["type"] == "status":
+                yield event
+                continue
+            if event["type"] == "react_error":
+                yield {
+                    "type": "final",
+                    "answer": event["answer"],
+                    "explanation": event["explanation"],
+                    "sources": event.get("sources", []),
+                }
+                return
+            if event["type"] == "react_result":
+                react_result = ReActLoopResult(
+                    query_text=event["query_text"],
+                    chunks=event["chunks"],
+                    explanation=event["explanation"],
+                )
+                break
+
+        if react_result is None:
             yield {
                 "type": "final",
-                "answer": chunk_error.answer,
-                "explanation": chunk_error.explanation,
-                "sources": [source.model_dump() for source in chunk_error.sources],
+                "answer": "No accessible data found for your role",
+                "explanation": "The ReAct loop did not produce a final grounded result.",
+                "sources": [],
             }
             return
 
-        verified_result = self._run_verified_query(context, selected_chunks)
-        for delta in self._stream_text_chunks(verified_result.answer):
+        yield {
+            "type": "status",
+            "status": "Answering",
+            "detail": f"Composing a grounded answer from {len(react_result.chunks)} supporting passage(s).",
+        }
+        answer_text = ""
+        for delta in self._stream_answer(react_result.query_text, react_result.chunks):
             if delta:
+                answer_text += delta
                 yield {"type": "token", "delta": delta}
 
         yield {
             "type": "final",
-            "answer": verified_result.answer,
-            "explanation": verified_result.explanation,
-            "sources": [source.model_dump() for source in verified_result.sources],
+            "answer": answer_text or self._generate_answer(react_result.query_text, react_result.chunks),
+            "explanation": react_result.explanation,
+            "sources": [source.model_dump() for source in self._build_sources(react_result.chunks)],
         }

@@ -20,6 +20,17 @@ function ChatMessage({
   return (
     <div className="w-full">
       <div className="max-w-3xl text-sm leading-7 text-zinc-100">
+        {message.isStreaming && (message.agentStatus || message.agentDetail) ? (
+          <div className="mb-3 rounded-2xl border border-white/10 bg-[#242424] px-4 py-3 text-xs text-zinc-300">
+            <p className="font-medium text-zinc-100">
+              {message.agentStatus ? `${message.agentStatus}...` : 'Working...'}
+            </p>
+            {message.agentDetail ? (
+              <p className="mt-1 text-zinc-400">{message.agentDetail}</p>
+            ) : null}
+          </div>
+        ) : null}
+
         <p className="whitespace-pre-wrap">
           {message.text}
           {message.isStreaming ? (

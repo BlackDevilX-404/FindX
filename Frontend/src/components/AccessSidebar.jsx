@@ -9,8 +9,6 @@ function AccessSidebar({
   onConversationSelect,
   onDeleteConversation,
   onNewChat,
-  uploadVisibilityScope,
-  onUploadVisibilityChange,
   onFileUpload,
   onToggle,
 }) {
@@ -71,8 +69,6 @@ function AccessSidebar({
 
       <UploadPanel
         currentUser={currentUser}
-        uploadVisibilityScope={uploadVisibilityScope}
-        onUploadVisibilityChange={onUploadVisibilityChange}
         onFileUpload={onFileUpload}
         totalCount={documents.length}
       />

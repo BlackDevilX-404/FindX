@@ -7,6 +7,7 @@ import {
   clearStoredToken,
   deleteDocument,
   fetchCurrentUser,
+  fetchUploadProgress,
   getStoredToken,
   loginUser,
   sendChatMessageStream,
@@ -17,6 +18,7 @@ import {
 import LoginPage from './components/LoginPage'
 import Navbar from './components/Navbar'
 import SourceViewer from './components/SourceViewer'
+import VisibilitySelector from './components/VisibilitySelector'
 import {
   INITIAL_DOCUMENTS,
   SUGGESTED_QUERIES,
@@ -166,6 +168,13 @@ function buildUploadedDocument(result, currentUser) {
     currentUser?.username ??
     currentUser?.email ??
     'Unknown owner'
+  const uploadedAt = new Date().toLocaleString([], {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
 
   return {
     id: result?.document_id ?? crypto.randomUUID(),
@@ -173,8 +182,8 @@ function buildUploadedDocument(result, currentUser) {
     type: getFileTypeLabel(filename),
     ownerId: currentUser?.id ?? 'unknown-owner',
     ownerName,
-    uploadedAt: 'Just now',
-    visibilityScope: 'private',
+    uploadedAt,
+    visibilityScope: normalizeVisibilityScope(result?.visibility_scope ?? 'private'),
     summary: `Indexed ${result?.chunks_indexed ?? 0} chunk(s) in ${result?.category ?? 'GENERAL'} category.`,
     category: result?.category ?? 'GENERAL',
     sensitivity: result?.sensitivity ?? null,
@@ -219,7 +228,11 @@ function App() {
   const [loginError, setLoginError] = useState('')
   const [uploadError, setUploadError] = useState('')
   const [uploadVisibilityScope, setUploadVisibilityScope] = useState('private')
+  const [pendingUploadFiles, setPendingUploadFiles] = useState([])
   const [isUploading, setIsUploading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(0)
+  const [uploadStatusText, setUploadStatusText] = useState('')
+  const [uploadPhase, setUploadPhase] = useState('uploading')
   const [isLeftSidebarOpen, setIsLeftSidebarOpen] = useState(() =>
     readStorage(LEFT_SIDEBAR_OPEN_KEY, getDefaultSidebarOpen()),
   )
@@ -461,6 +474,15 @@ function App() {
       return
     }
 
+    const targetConversation = (chatStore[userKey] ?? []).find(
+      (conversation) => conversation.id === conversationId,
+    )
+    const targetTitle = targetConversation?.title ?? 'this chat'
+    const confirmed = window.confirm(`Delete "${targetTitle}" from chat history?`)
+    if (!confirmed) {
+      return
+    }
+
     if (activeStreamConversationIdRef.current === conversationId) {
       activeStreamControllerRef.current?.abort()
       activeStreamControllerRef.current = null
@@ -547,7 +569,9 @@ function App() {
                   type: 'assistant',
                   kind: 'response',
                   text: '',
-                  explanation: 'Finding the strongest evidence...',
+                  explanation: 'The agent is planning the fastest authorized retrieval path.',
+                  agentStatus: 'Thinking',
+                  agentDetail: 'The agent is planning the fastest authorized retrieval path.',
                   sources: [],
                   createdAt: assistantCreatedAt,
                   isStreaming: true,
@@ -570,6 +594,25 @@ function App() {
         chatHistory: formatChatHistory(existingConversation?.messages ?? []),
         signal: streamController.signal,
         onEvent: (event) => {
+          if (event.type === 'status') {
+            patchConversationMessage(
+              conversationId,
+              assistantMessageId,
+              (message) => {
+                const nextStatus = event.status || 'Thinking'
+                const nextDetail = event.detail || nextStatus
+
+                return {
+                  ...message,
+                  agentStatus: nextStatus,
+                  agentDetail: nextDetail,
+                  explanation: nextDetail,
+                }
+              },
+            )
+            return
+          }
+
           if (event.type === 'token') {
             streamedText += event.delta ?? ''
             patchConversationMessage(
@@ -578,6 +621,7 @@ function App() {
               (message) => ({
                 ...message,
                 text: streamedText,
+                agentStatus: message.agentStatus,
               }),
             )
             return
@@ -597,6 +641,8 @@ function App() {
                 explanation:
                   event.explanation ||
                   'This answer is grounded in the document evidence selected by the backend agent.',
+                agentStatus: null,
+                agentDetail: null,
                 sources,
                 isStreaming: false,
               }),
@@ -645,24 +691,132 @@ function App() {
     setUploadVisibilityScope(scope)
   }
 
-  const handleFileUpload = async (event) => {
+  const handleFileUpload = (event) => {
     const files = Array.from(event.target.files ?? [])
 
     if (!files.length || !currentUser || !authToken) {
       return
     }
 
+    setPendingUploadFiles(files)
+    event.target.value = ''
+  }
+
+  const handleCancelPendingUpload = () => {
+    setPendingUploadFiles([])
+  }
+
+  const handleConfirmPendingUpload = async () => {
+    const files = pendingUploadFiles
+    if (!files.length || !currentUser || !authToken) {
+      return
+    }
+
     setUploadError('')
     setIsUploading(true)
+    setUploadPhase('uploading')
+    setUploadProgress(0)
+    setUploadStatusText('Uploading your files...')
+    setPendingUploadFiles([])
 
     try {
+      const transportProgressByFile = {}
+      const transportCompleteByFile = {}
+      const ingestProgressByFile = {}
       const results = await Promise.all(
-        files.map((file) =>
-          uploadFileToSession({
-            token: authToken,
-            sessionId: getBackendSessionId(currentUser),
-            file,
-            visibilityScope: uploadVisibilityScope,
+        files.map((file, index) =>
+          new Promise((resolve, reject) => {
+            const uploadId = crypto.randomUUID()
+            let pollHandle = null
+
+            const syncPhaseProgress = () => {
+              const allUploadsComplete =
+                files.length > 0 &&
+                files.every((_, fileIndex) => Boolean(transportCompleteByFile[fileIndex]))
+
+              if (!allUploadsComplete) {
+                const uploadValues = files.map((_, fileIndex) => Number(transportProgressByFile[fileIndex] || 0))
+                const averageUpload = Math.round(
+                  uploadValues.reduce((sum, value) => sum + value, 0) / files.length,
+                )
+                setUploadPhase('uploading')
+                setUploadProgress(Math.max(0, Math.min(100, averageUpload)))
+                return
+              }
+
+              const processingValues = files.map((_, fileIndex) => Number(ingestProgressByFile[fileIndex] || 0))
+              const averageProcessing = Math.round(
+                processingValues.reduce((sum, value) => sum + value, 0) / files.length,
+              )
+              setUploadPhase('processing')
+              setUploadProgress(Math.max(0, Math.min(100, averageProcessing)))
+            }
+
+            const stopPolling = () => {
+              if (pollHandle) {
+                window.clearInterval(pollHandle)
+                pollHandle = null
+              }
+            }
+
+            const pollProgress = async () => {
+              try {
+                const progress = await fetchUploadProgress({
+                  token: authToken,
+                  uploadId,
+                })
+                ingestProgressByFile[index] = Number(progress.progress || 0)
+                syncPhaseProgress()
+
+                if (typeof progress.detail === 'string' && progress.detail) {
+                  setUploadStatusText(progress.detail)
+                }
+
+                if (progress.done) {
+                  stopPolling()
+                }
+              } catch {
+                // Upload progress may not be available immediately; keep polling quietly.
+              }
+            }
+
+            uploadFileToSession({
+              token: authToken,
+              sessionId: getBackendSessionId(currentUser),
+              file,
+              visibilityScope: uploadVisibilityScope,
+              uploadId,
+              onProgress: (progressValue) => {
+                transportProgressByFile[index] = Math.round(Number(progressValue || 0) * 100)
+                syncPhaseProgress()
+                setUploadStatusText('Uploading your files...')
+              },
+              onUploadComplete: () => {
+                transportCompleteByFile[index] = true
+                ingestProgressByFile[index] = 0
+                setUploadPhase('processing')
+                setUploadProgress(0)
+                setUploadStatusText('Processing your files...')
+                syncPhaseProgress()
+                if (!pollHandle) {
+                  pollHandle = window.setInterval(pollProgress, 500)
+                }
+                pollProgress()
+              },
+            })
+              .then((result) => {
+                ingestProgressByFile[index] = 100
+                transportProgressByFile[index] = 100
+                transportCompleteByFile[index] = true
+                syncPhaseProgress()
+                setUploadStatusText('Upload and indexing completed.')
+                stopPolling()
+                resolve(result)
+              })
+              .catch((error) => {
+                stopPolling()
+                reject(error)
+              })
           }),
         ),
       )
@@ -682,9 +836,10 @@ function App() {
       setUploadError(error.message || 'Upload failed.')
     } finally {
       setIsUploading(false)
+      setUploadProgress(0)
+      setUploadStatusText('')
+      setUploadPhase('uploading')
     }
-
-    event.target.value = ''
   }
 
   const handleDocumentVisibilityChange = async (documentId, scope) => {
@@ -730,6 +885,13 @@ function App() {
     const target = documents.find((document) => document.id === documentId)
 
     if (!target || !canDeleteDocument(target, currentUser) || !authToken) {
+      return
+    }
+
+    const confirmed = window.confirm(
+      `Delete "${target.name}"? This will remove it from the index and database.`,
+    )
+    if (!confirmed) {
       return
     }
 
@@ -793,7 +955,60 @@ function App() {
 
         {isUploading ? (
           <div className="mt-4 rounded-2xl border border-[var(--border-soft)] bg-[var(--surface-1)] px-4 py-3 text-sm text-[var(--text-muted)]">
-            Uploading and indexing your files...
+            <div className="flex items-center justify-between gap-3">
+              <span>
+                {uploadPhase === 'processing'
+                  ? (uploadStatusText || 'Processing your files...')
+                  : (uploadStatusText || 'Uploading your files...')}
+              </span>
+              <span className="text-xs text-[var(--text-main)]">{uploadProgress}%</span>
+            </div>
+            <div className="mt-3 h-2 overflow-hidden rounded-full bg-[var(--surface-3)]">
+              <div
+                className="h-full rounded-full bg-[var(--accent)] transition-[width] duration-200 ease-out"
+                style={{ width: `${uploadProgress}%` }}
+              />
+            </div>
+          </div>
+        ) : null}
+
+        {pendingUploadFiles.length ? (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 px-4">
+            <div className="w-full max-w-md rounded-3xl border border-white/10 bg-[#171717] p-5 shadow-[0_24px_80px_rgba(0,0,0,0.35)]">
+              <h2 className="text-base font-medium text-white">Choose Visibility</h2>
+              <p className="mt-2 text-sm text-zinc-400">
+                Set who can access {pendingUploadFiles.length === 1 ? 'this file' : 'these files'} before upload starts.
+              </p>
+
+              <div className="mt-4">
+                <VisibilitySelector
+                  value={uploadVisibilityScope}
+                  onChange={handleUploadVisibilityChange}
+                  title="Visibility preference"
+                />
+              </div>
+
+              <div className="mt-4 rounded-2xl border border-white/10 bg-[#212121] px-4 py-3 text-sm text-zinc-300">
+                {pendingUploadFiles.map((file) => file.name).join(', ')}
+              </div>
+
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={handleCancelPendingUpload}
+                  className="rounded-full border border-white/10 bg-[#212121] px-4 py-2 text-sm text-zinc-300 transition hover:bg-[#2a2a2a]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmPendingUpload}
+                  className="rounded-full border border-white/10 bg-[#2f2f2f] px-4 py-2 text-sm text-white transition hover:bg-[#3a3a3a]"
+                >
+                  Continue Upload
+                </button>
+              </div>
+            </div>
           </div>
         ) : null}
 
@@ -801,8 +1016,6 @@ function App() {
           <AdminDashboard
             currentUser={currentUser}
             documents={documents}
-            uploadVisibilityScope={uploadVisibilityScope}
-            onUploadVisibilityChange={handleUploadVisibilityChange}
             onFileUpload={handleFileUpload}
             onDocumentVisibilityChange={handleDocumentVisibilityChange}
             onDeleteDocument={handleDeleteDocument}
@@ -823,8 +1036,6 @@ function App() {
                 onConversationSelect={setActiveConversationId}
                 onDeleteConversation={handleDeleteConversation}
                 onNewChat={handleNewChat}
-                uploadVisibilityScope={uploadVisibilityScope}
-                onUploadVisibilityChange={handleUploadVisibilityChange}
                 onFileUpload={handleFileUpload}
                 onToggle={() => setIsLeftSidebarOpen(false)}
               />

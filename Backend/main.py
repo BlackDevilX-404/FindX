@@ -1,5 +1,6 @@
 import json
 import time
+import threading
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
@@ -27,6 +28,7 @@ try:
         SourceItem,
         validate_visibility_scope,
     )
+    from .system_id import get_system_id
 except ImportError:
     from auth import (
         LoginRequest,
@@ -47,9 +49,12 @@ except ImportError:
         SourceItem,
         validate_visibility_scope,
     )
+    from system_id import get_system_id
 
 bootstrap_database()
 rag_service = EnterpriseRAGService()
+upload_progress_store: dict[str, dict[str, Any]] = {}
+upload_progress_lock = threading.Lock()
 
 app = FastAPI(
     title="FindX Enterprise Agentic RAG API",
@@ -85,7 +90,17 @@ class UploadResponse(BaseModel):
     document: str
     category: str
     sensitivity: str | None = None
+    visibility_scope: str
     chunks_indexed: int
+
+
+class UploadProgressResponse(BaseModel):
+    upload_id: str
+    stage: str
+    progress: int
+    detail: str = ""
+    done: bool = False
+    error: str | None = None
 
 
 class VisibilityUpdateRequest(BaseModel):
@@ -132,15 +147,53 @@ def _resolve_query_scope(request: QueryRequest, current_user: dict[str, Any]) ->
     return requested_chat_id or str(current_user.get("id") or current_user["username"])
 
 
-def _build_upload_response(result: IngestResult) -> UploadResponse:
+def _build_upload_response(result: IngestResult, visibility_scope: str) -> UploadResponse:
     return UploadResponse(
         message="Document uploaded and indexed successfully",
         document_id=result.document_id,
         document=result.document,
         category=result.category,
         sensitivity=result.sensitivity,
+        visibility_scope=visibility_scope,
         chunks_indexed=result.chunks_indexed,
     )
+
+
+def _stage_progress_percentage(stage: str, current: int, total: int) -> int:
+    safe_total = max(total, 1)
+    stage_ratio = max(0.0, min(current / safe_total, 1.0))
+    if stage == "EXTRACT":
+        return round(stage_ratio * 35)
+    if stage == "CHUNK":
+        return round(35 + (stage_ratio * 25))
+    if stage == "INDEX":
+        return round(60 + (stage_ratio * 40))
+    if stage == "DONE":
+        return 100
+    return 0
+
+
+def _set_upload_progress(
+    upload_id: str,
+    *,
+    stage: str,
+    progress: int,
+    detail: str = "",
+    done: bool = False,
+    error: str | None = None,
+) -> None:
+    if not upload_id:
+        return
+    with upload_progress_lock:
+        upload_progress_store[upload_id] = {
+            "upload_id": upload_id,
+            "stage": stage,
+            "progress": max(0, min(100, int(progress))),
+            "detail": detail,
+            "done": bool(done),
+            "error": error,
+            "updated_at": time.time(),
+        }
 
 
 @app.post("/login", response_model=TokenResponse)
@@ -162,27 +215,35 @@ async def read_current_user(current_user: dict[str, Any] = Depends(get_current_u
 
 @app.post("/upload", response_model=UploadResponse)
 @app.post("/api/upload/file", response_model=UploadResponse)
-async def upload_document(
+def upload_document(
     file: UploadFile = File(...),
     category: str = Form("GENERAL"),
     sensitivity: str | None = Form(None),
     visibility_scope: str = Form("private"),
     session_id: str | None = Form(None),
+    upload_id: str | None = Form(None),
     current_user: dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
 ):
     filename = file.filename or "uploaded-file"
-    file_bytes = await file.read()
+    file_bytes = file.file.read()
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
     upload_started_at = time.perf_counter()
+    system_id = get_system_id()
     print(
         (
-            f"[Upload] [{filename}] Received from {current_user['username']} | "
+            f"[Upload] [{filename}] Received from {current_user['username']} on system={system_id} | "
             f"size={_format_file_size(len(file_bytes))} | "
             f"category={category} | visibility={visibility_scope}"
         ),
         flush=True,
+    )
+    _set_upload_progress(
+        upload_id or "",
+        stage="EXTRACT",
+        progress=0,
+        detail="Starting extraction and indexing.",
     )
 
     try:
@@ -194,17 +255,43 @@ async def upload_document(
             sensitivity=sensitivity,
             visibility_scope=visibility_scope,
             uploaded_by=current_user["username"],
+            system_id=system_id,
+            progress_callback=(
+                lambda progress: _set_upload_progress(
+                    upload_id or "",
+                    stage=progress.stage,
+                    progress=_stage_progress_percentage(progress.stage, progress.current, progress.total),
+                    detail=progress.detail,
+                    done=progress.stage == "DONE",
+                )
+            ),
         )
     except ValueError as exc:
         print(
             f"[Upload] [{filename}] Rejected after {_format_duration(time.perf_counter() - upload_started_at)} | {exc}",
             flush=True,
         )
+        _set_upload_progress(
+            upload_id or "",
+            stage="ERROR",
+            progress=100,
+            detail="Upload failed during validation.",
+            done=True,
+            error=str(exc),
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         print(
             f"[Upload] [{filename}] Failed after {_format_duration(time.perf_counter() - upload_started_at)} | {exc}",
             flush=True,
+        )
+        _set_upload_progress(
+            upload_id or "",
+            stage="ERROR",
+            progress=100,
+            detail="Upload failed during ingestion.",
+            done=True,
+            error=str(exc),
         )
         raise HTTPException(status_code=500, detail=f"Upload failed: {exc}") from exc
 
@@ -216,6 +303,7 @@ async def upload_document(
         visibility_scope=validate_visibility_scope(visibility_scope),
         uploaded_by=current_user["username"],
         chunks_indexed=result.chunks_indexed,
+        system_id=system_id,
     )
     print(
         (
@@ -224,7 +312,14 @@ async def upload_document(
         ),
         flush=True,
     )
-    return _build_upload_response(result)
+    _set_upload_progress(
+        upload_id or "",
+        stage="DONE",
+        progress=100,
+        detail="Upload and indexing completed.",
+        done=True,
+    )
+    return _build_upload_response(result, validate_visibility_scope(visibility_scope))
 
 
 @app.patch("/api/documents/{document_id}/visibility")
@@ -234,17 +329,63 @@ async def update_document_visibility(
     current_user: dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
 ):
     normalized_scope = validate_visibility_scope(request.visibility_scope)
+    
+    print(
+        f"[Visibility Update] Admin {current_user['username']} updating document {document_id} to visibility '{normalized_scope}'",
+        flush=True,
+    )
+    
     updated_in_index = rag_service.update_document_visibility(document_id, normalized_scope)
     updated_in_db = update_document_visibility_record(document_id, normalized_scope)
 
+    if not updated_in_index:
+        print(
+            f"[Visibility Update WARNING] Failed to update visibility in Chroma index for document {document_id}",
+            flush=True,
+        )
+    
+    if not updated_in_db:
+        print(
+            f"[Visibility Update WARNING] Failed to update visibility in MongoDB for document {document_id}",
+            flush=True,
+        )
+
     if not updated_in_index and not updated_in_db:
-        raise HTTPException(status_code=404, detail="Document not found")
+        raise HTTPException(
+            status_code=404, 
+            detail="Document not found in both index and database"
+        )
+    
+    if updated_in_index and updated_in_db:
+        print(
+            f"[Visibility Update SUCCESS] Document {document_id} visibility updated to '{normalized_scope}' in both systems",
+            flush=True,
+        )
+    else:
+        print(
+            f"[Visibility Update PARTIAL] Document {document_id} updated in {'index' if updated_in_index else 'database'} only",
+            flush=True,
+        )
 
     return {
         "document_id": document_id,
         "visibility_scope": normalized_scope,
         "message": "Document visibility updated successfully",
     }
+
+
+@app.get("/api/upload/progress/{upload_id}", response_model=UploadProgressResponse)
+async def get_upload_progress(
+    upload_id: str,
+    current_user: dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
+):
+    with upload_progress_lock:
+        progress = upload_progress_store.get(upload_id)
+
+    if not progress:
+        raise HTTPException(status_code=404, detail="Upload progress not found")
+
+    return UploadProgressResponse(**{key: value for key, value in progress.items() if key != "updated_at"})
 
 
 @app.delete("/api/documents/{document_id}")
@@ -276,6 +417,7 @@ async def query_documents(
         query=request.query,
     )
 
+    system_id = get_system_id()
     try:
         result = rag_service.query(
             request.query,
@@ -283,6 +425,7 @@ async def query_documents(
             chat_id=_resolve_query_scope(request, current_user),
             doc_uuid=request.doc_uuid,
             chat_history=request.chat_history,
+            system_id=system_id,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Query failed: {exc}") from exc
@@ -305,6 +448,7 @@ async def stream_query_documents(
         query=request.query,
     )
 
+    system_id = get_system_id()
     try:
         stream = rag_service.stream_query(
             request.query,
@@ -312,6 +456,7 @@ async def stream_query_documents(
             chat_id=_resolve_query_scope(request, current_user),
             doc_uuid=request.doc_uuid,
             chat_history=request.chat_history,
+            system_id=system_id,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Query failed: {exc}") from exc

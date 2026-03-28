@@ -50,12 +50,19 @@ function InputBox({ input, onInputChange, onSubmit, isTyping }) {
     }
 
     recognition.onerror = (event) => {
+      console.error('Speech recognition error:', event.error)
       if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
         setMicError('Microphone permission was blocked in the browser.')
       } else if (event.error === 'no-speech') {
         setMicError('No speech was detected. Try again.')
+      } else if (event.error === 'audio-capture') {
+        setMicError('Cannot access microphone. Check your microphone connection.')
+      } else if (event.error === 'network') {
+        setMicError('Network error. Please check your internet connection.')
+      } else if (event.error === 'service-not-available') {
+        setMicError('Speech service unavailable. Try again later.')
       } else {
-        setMicError('Voice input failed. Try again.')
+        setMicError(`Voice input failed (${event.error}). Try again.`)
       }
     }
 

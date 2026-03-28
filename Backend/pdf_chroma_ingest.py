@@ -127,18 +127,6 @@ def extract_keywords(text: str) -> set[str]:
     }
 
 
-def keyword_overlap(question: str, text: str) -> float:
-    question_terms = extract_keywords(question)
-    if not question_terms:
-        return 0.0
-
-    text_terms = extract_keywords(text)
-    if not text_terms:
-        return 0.0
-
-    return len(question_terms & text_terms) / len(question_terms)
-
-
 def coerce_page_number(value: Any) -> Optional[int]:
     if value is None:
         return None
@@ -337,23 +325,14 @@ class ChromaMultimodalDB:
     ) -> tuple[str, Optional[int]]:
         best_text = text
         best_page = page
-        best_score = keyword_overlap(question, text)
 
         current_page_text = self._resolve_page_text(doc_uuid, page=page, page_label=page_label)
         if current_page_text:
-            current_page_score = keyword_overlap(question, current_page_text)
-            if (
-                len(current_page_text) > len(best_text)
-                and (
-                    current_page_score > best_score
-                    or is_heading_like(best_text)
-                    or len(best_text) < 120
-                )
+            if len(current_page_text) > len(best_text) and (
+                is_heading_like(best_text) or len(best_text) < 120
             ):
                 best_text = current_page_text
-                best_score = current_page_score
 
-        heading_terms = extract_keywords(best_text)
         if best_page is None:
             best_page = coerce_page_number(page_label)
 
@@ -369,18 +348,8 @@ class ChromaMultimodalDB:
             if not candidate_text:
                 continue
 
-            candidate_score = keyword_overlap(question, candidate_text)
-            candidate_terms = extract_keywords(candidate_text)
-            if heading_terms and heading_terms & candidate_terms:
-                candidate_score += 0.15
-            if len(candidate_text) > 140:
-                candidate_score += 0.05
-
-            if candidate_score > best_score and (
-                is_heading_like(best_text) or candidate_score >= 0.12
-            ):
+            if is_heading_like(best_text) and len(candidate_text) > len(best_text):
                 best_text = candidate_text
-                best_score = candidate_score
                 best_page = candidate_page
 
         return best_text, best_page
@@ -508,8 +477,7 @@ class ChromaMultimodalDB:
 
             numeric_distance = float(distance or 0.0)
             semantic_score = 1.0 / (1.0 + max(numeric_distance, 0.0))
-            lexical_score = keyword_overlap(question, text)
-            combined_score = round((semantic_score * 0.82) + (lexical_score * 0.18), 4)
+            combined_score = round(semantic_score, 4)
 
             doc_uuid = str(metadata.get("doc_uuid") or "unknown")
             raw_page_value = metadata.get("page_label") or metadata.get("page")
